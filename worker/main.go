@@ -20,8 +20,8 @@ import (
 const (
 	dbPath        = "../brawl_data.sqlite"
 	baseURL       = "https://api.brawlstars.com/v1"
-	poolSize      = 50  // Concurrent workers
-	batchLoadSize = 200 // Number of tags to pull from DB into memory at once
+	poolSize      = 64   // Increased concurrent workers
+	batchLoadSize = 1000 // Larger batch to reduce DB contention
 )
 
 var (
@@ -46,8 +46,8 @@ func main() {
 	}
 	defer db.Close()
 
-	// Prep the job channel
-	jobs := make(chan string, batchLoadSize)
+	// Prep the job channel (Buffered for high-throughput)
+	jobs := make(chan string, batchLoadSize*2)
 	var wg sync.WaitGroup
 
 	// High-throughput HTTP client
@@ -83,18 +83,18 @@ func main() {
 			wg.Wait()
 			return
 		default:
-			// Fill the jobs queue if it's running low
-			if len(jobs) < 10 {
+			// Fill the jobs queue if it's running low (Reduce starvation)
+			if len(jobs) < poolSize {
 				tags := fetchUnprocessedTags(db, batchLoadSize)
 				if len(tags) == 0 {
-					time.Sleep(2 * time.Second) // Wait for Python scraper to find more
+					time.Sleep(2 * time.Second) // Wait for Python scraper
 					continue
 				}
 				for _, t := range tags {
 					jobs <- t
 				}
 			}
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond) // More responsive loop
 		}
 	}
 }

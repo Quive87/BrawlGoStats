@@ -7,134 +7,134 @@
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg: #0a0a0c;
-            --card-bg: rgba(255, 255, 255, 0.03);
-            --accent: #00f2ff;
-            --accent-glow: rgba(0, 242, 255, 0.3);
+            --bg: #000000;
+            --card-bg: #000000;
+            --border: #333333;
+            --border-hover: #444444;
+            --accent: #ffffff;
             --text: #ffffff;
-            --text-dim: #a0a0a0;
+            --text-dim: #888888;
             --success: #00ff88;
             --error: #ff4d4d;
-            --warning: #ffcc00;
+            --warning: #f5a623;
         }
 
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
-            font-family: 'Outfit', sans-serif;
+            font-family: 'Inter', 'Outfit', sans-serif;
         }
 
         body {
             background-color: var(--bg);
             color: var(--text);
             overflow-x: hidden;
-            background-image: 
-                radial-gradient(circle at 20% 20%, rgba(0, 242, 255, 0.05) 0%, transparent 40%),
-                radial-gradient(circle at 80% 80%, rgba(181, 0, 255, 0.05) 0%, transparent 40%);
             min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1000px;
             margin: 0 auto;
-            padding: 40px 20px;
+            padding: 60px 24px;
         }
 
         header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 40px;
+            margin-bottom: 60px;
         }
 
         .logo {
-            font-size: 28px;
-            font-weight: 800;
-            letter-spacing: -1px;
-            background: linear-gradient(90deg, #fff, var(--accent));
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-fill-color: transparent;
+            font-size: 20px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .logo svg {
+            width: 24px;
+            height: 24px;
         }
 
         .status-badge {
-            padding: 8px 16px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: 600;
-            background: rgba(0, 255, 136, 0.1);
-            color: var(--success);
-            border: 1px solid rgba(0, 255, 136, 0.2);
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            background: #000;
+            color: var(--text);
+            border: 1px solid var(--border);
             display: flex;
             align-items: center;
             gap: 8px;
         }
 
         .status-dot {
-            width: 8px;
-            height: 8px;
+            width: 6px;
+            height: 6px;
             background: var(--success);
             border-radius: 50%;
-            box-shadow: 0 0 10px var(--success);
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0% { opacity: 0.4; }
-            50% { opacity: 1; }
-            100% { opacity: 0.4; }
         }
 
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1px;
+            background: var(--border);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 40px;
         }
 
         .card {
             background: var(--card-bg);
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            border-radius: 24px;
-            padding: 30px;
-            backdrop-filter: blur(10px);
-            transition: transform 0.3s ease, border-color 0.3s ease;
+            padding: 32px;
+            transition: background 0.2s ease;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
         }
 
         .card:hover {
-            border-color: rgba(0, 242, 255, 0.3);
-            transform: translateY(-5px);
+            background: #050505;
         }
 
         .card-title {
-            font-size: 14px;
-            font-weight: 600;
+            font-size: 13px;
+            font-weight: 500;
             color: var(--text-dim);
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-bottom: 20px;
+            margin-bottom: 24px;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
+            text-transform: none;
+            letter-spacing: 0;
         }
 
         .value {
-            font-size: 42px;
-            font-weight: 800;
-            margin-bottom: 10px;
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            letter-spacing: -1px;
         }
 
         .sub-value {
-            font-size: 14px;
+            font-size: 13px;
             color: var(--text-dim);
         }
 
         .progress-container {
-            margin-top: 20px;
-            background: rgba(255, 255, 255, 0.05);
-            height: 8px;
-            border-radius: 4px;
+            margin-top: 24px;
+            background: #111;
+            height: 4px;
+            border-radius: 2px;
             overflow: hidden;
             position: relative;
         }
@@ -144,59 +144,90 @@
             top: 0;
             left: 0;
             height: 100%;
-            background: linear-gradient(90deg, var(--accent), #b500ff);
+            background: var(--text);
             width: 0%;
-            transition: width 1s ease;
-            box-shadow: 0 0 15px var(--accent-glow);
+            transition: width 1s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
         .stat-row {
             display: flex;
             justify-content: space-between;
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid rgba(255, 255, 255, 0.05);
+            margin-top: 24px;
+            padding-top: 16px;
+            border-top: 1px solid #111;
         }
 
         .stat-label {
             color: var(--text-dim);
-            font-size: 14px;
+            font-size: 13px;
         }
 
         .stat-value {
-            font-weight: 600;
-            font-size: 14px;
+            font-weight: 500;
+            font-size: 13px;
+            color: var(--text);
         }
 
         .alert-active {
             color: var(--error);
-            font-weight: 800;
-            animation: shake 0.5s infinite;
-        }
-
-        @keyframes shake {
-            0%, 100% { transform: translateX(0); }
-            25% { transform: translateX(-2px); }
-            75% { transform: translateX(2px); }
+            font-weight: 500;
         }
 
         footer {
             margin-top: 40px;
-            text-align: center;
+            text-align: left;
             color: var(--text-dim);
-            font-size: 14px;
+            font-size: 13px;
+            border-top: 1px solid var(--border);
+            padding-top: 24px;
+        }
+
+        .btn-primary {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 8px 16px;
+            background: #fff;
+            color: #000;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: opacity 0.2s;
+        }
+
+        .btn-secondary {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 8px 16px;
+            background: #000;
+            color: #fff;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: border-color 0.2s;
+        }
+
+        .btn-secondary:hover {
+            border-color: var(--text);
         }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <div class="logo">BrawlGo STATS</div>
-            <div style="display: flex; gap: 15px; align-items: center;">
-                <a href="/docs" style="color: var(--accent); text-decoration: none; font-weight: 600; font-size: 13px; border: 1px solid var(--accent); padding: 5px 15px; border-radius: 20px; text-transform: uppercase; letter-spacing: 0.5px; backdrop-filter: blur(5px); transition: all 0.3s ease;">API Docs</a>
+            <div class="logo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 3 4 8 5-5 5 15H2L8 3z"/></svg>
+                BrawlGo
+            </div>
+            <div style="display: flex; gap: 12px; align-items: center;">
+                <a href="/docs" class="btn-secondary" style="height: 32px; padding: 0 12px;">Docs</a>
                 <div id="status-badge" class="status-badge">
                     <div class="status-dot"></div>
-                    Live Engine Dashboard
+                    Engine Live
                 </div>
             </div>
         </header>
@@ -204,65 +235,73 @@
         <div class="grid">
             <!-- Database Health -->
             <div class="card">
-                <div class="card-title">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12A9 9 0 0 1 12 21A9 9 0 0 1 3 12A9 9 0 0 1 12 3A9 9 0 0 1 21 12Z"/><path d="M12 7v5l3 3"/></svg>
-                    Database Size (40GB Target)
-                </div>
-                <div id="db-size" class="value">0.00 GB</div>
-                <div class="sub-value">SQLite Optimized (WAL Mode)</div>
-                <div class="progress-container">
-                    <div id="db-progress" class="progress-bar"></div>
+                <div>
+                    <div class="card-title">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12A9 9 0 0 1 12 21A9 9 0 0 1 3 12A9 9 0 0 1 12 3A9 9 0 0 1 21 12Z"/><path d="M12 7v5l3 3"/></svg>
+                        Database Capacity
+                    </div>
+                    <div id="db-size" class="value">0.00 GB</div>
+                    <div class="sub-value">SQLite WAL Optimized</div>
+                    <div class="progress-container">
+                        <div id="db-progress" class="progress-bar"></div>
+                    </div>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Memory Mapping</span>
-                    <span id="mmap-status" class="stat-value">30 GB Active</span>
+                    <span class="stat-label">Mmap Allocation</span>
+                    <span id="mmap-status" class="stat-value">30 GB</span>
                 </div>
             </div>
 
             <!-- Sync Progress -->
             <div class="card">
-                <div class="card-title">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-                    Go Worker Sync
-                </div>
-                <div id="sync-rate" class="value">0%</div>
-                <div id="sync-numbers" class="sub-value">0 / 0 Players Processed</div>
-                <div class="progress-container">
-                    <div id="sync-progress" class="progress-bar"></div>
+                <div>
+                    <div class="card-title">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+                        Worker Throughput
+                    </div>
+                    <div id="sync-rate" class="value">0%</div>
+                    <div id="sync-numbers" class="sub-value">0 / 0 Players</div>
+                    <div class="progress-container">
+                        <div id="sync-progress" class="progress-bar"></div>
+                    </div>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Stored Matches</span>
+                    <span class="stat-label">Indexed Matches</span>
                     <span id="total-matches" class="stat-value">0</span>
                 </div>
             </div>
 
             <!-- Developer Access -->
             <div class="card">
-                <div class="card-title">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
-                    Developer Documentation
+                <div>
+                    <div class="card-title">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+                        API Exploration
+                    </div>
+                    <div class="value" style="font-size: 24px;">Swagger Interface</div>
+                    <div class="sub-value">Real-time endpoint testing</div>
                 </div>
-                <div class="value" style="font-size: 32px;">Swagger UI</div>
-                <div class="sub-value">Explore and test all API endpoints live.</div>
-                <div style="display: flex; gap: 10px; margin-top: 25px;">
-                    <a href="/docs" style="flex: 1; text-align: center; padding: 12px; background: rgba(0, 242, 255, 0.1); border: 1px solid var(--accent); border-radius: 12px; color: var(--accent); text-decoration: none; font-weight: 600; font-size: 14px; transition: all 0.2s ease;">Swagger</a>
-                    <a href="/redoc" style="flex: 1; text-align: center; padding: 12px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; color: var(--text); text-decoration: none; font-weight: 600; font-size: 14px; transition: all 0.2s ease;">ReDoc</a>
+                <div style="display: flex; gap: 8px; margin-top: 24px;">
+                    <a href="/docs" class="btn-primary" style="flex: 1;">Swagger</a>
+                    <a href="/redoc" class="btn-secondary" style="flex: 1;">ReDoc</a>
                 </div>
             </div>
 
             <!-- Hardware Health -->
             <div class="card">
-                <div class="card-title">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-                    Disk Availability
-                </div>
-                <div id="disk-free" class="value">0 GB</div>
-                <div id="disk-alert" class="sub-value">System Stability: Optimal</div>
-                <div class="progress-container">
-                    <div id="disk-progress" class="progress-bar" style="background: var(--success);"></div>
+                <div>
+                    <div class="card-title">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                        Local Storage
+                    </div>
+                    <div id="disk-free" class="value">0 GB</div>
+                    <div id="disk-alert" class="sub-value">Status: Nominal</div>
+                    <div class="progress-container">
+                        <div id="disk-progress" class="progress-bar"></div>
+                    </div>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Storage Warning</span>
+                    <span class="stat-label">Alert Status</span>
                     <span id="alert-status" class="stat-value">Normal</span>
                 </div>
             </div>
