@@ -93,6 +93,39 @@ def setup_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_players_tag ON match_players(player_tag);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_players_meta ON match_players(brawler_name, brawler_trophies);")
+
+    # --- High-Performance Fuzzy Search Setup (FTS5) ---
+    # We use 'trigram' tokenizer for insanely fast fuzzy matching
+    cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS players_search USING fts5(
+            tag UNINDEXED, 
+            name,
+            tokenize='trigram'
+        )
+    """)
+
+    # Triggers to keep the search index in sync with the main players table
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_players_search_insert AFTER INSERT ON players
+        BEGIN
+            INSERT INTO players_search(tag, name) VALUES (new.tag, new.name);
+        END;
+    """)
+    
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_players_search_update AFTER UPDATE OF name ON players
+        BEGIN
+            UPDATE players_search SET name = new.name WHERE tag = new.tag;
+        END;
+    """)
+    
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_players_search_delete AFTER DELETE ON players
+        BEGIN
+            DELETE FROM players_search WHERE tag = old.tag;
+        END;
+    """)
+
     conn.commit()
     return conn
 

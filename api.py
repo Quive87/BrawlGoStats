@@ -155,8 +155,37 @@ def get_player_battlelog(
 
 @app.get("/search", summary="Search Players by Name")
 def search_player_by_name(name: str = Query(..., examples=["Pika"])):
+    """
+    Insanely fast fuzzy matching using SQLite FTS5 Trigram index.
+    Returns up to 200 similar names, ranked by trophies.
+    """
     conn = get_db()
-    players = conn.execute("SELECT tag, name, trophies FROM players WHERE name LIKE ? ORDER BY trophies DESC LIMIT 20", (f"%{name}%",)).fetchall()
+    # FTS5 Trigram MATCH is extremely fast for substring and fuzzy-like matching
+    query = """
+        SELECT p.tag, p.name, p.trophies
+        FROM players_search ps
+        JOIN players p ON ps.tag = p.tag
+        WHERE ps.name MATCH ?
+        ORDER BY p.trophies DESC
+        LIMIT 200
+    """
+    try:
+        # Sanitize query: FTS5 MATCH can be sensitive to special characters
+        clean_name = name.strip()
+        if not clean_name:
+            return []
+            
+        players = conn.execute(query, (clean_name,)).fetchall()
+        
+        # Fallback to LIKE if FTS5 returns no results
+        if not players and len(clean_name) >= 2:
+            players = conn.execute("SELECT tag, name, trophies FROM players WHERE name LIKE ? ORDER BY trophies DESC LIMIT 200", (f"%{clean_name}%",)).fetchall()
+            
+    except Exception as e:
+        # Silently log and fallback to standard LIKE search if FTS5 fails
+        print(f"Search fallback: {e}")
+        players = conn.execute("SELECT tag, name, trophies FROM players WHERE name LIKE ? ORDER BY trophies DESC LIMIT 200", (f"%{name}%",)).fetchall()
+    
     conn.close()
     return [dict(p) for p in players]
 
