@@ -5,8 +5,7 @@ After=network.target
 [Service]
 User=root
 WorkingDirectory=/var/www/BrawlGoStats
-# If this fails, run 'which gunicorn' on your VPS and update this path
-ExecStart=gunicorn -w 4 -k uvicorn.workers.UvicornWorker api:app --bind 0.0.0.0:8089
+ExecStart=/var/www/BrawlGoStats/venv/bin/gunicorn -w 4 -k uvicorn.workers.UvicornWorker api:app --bind 0.0.0.0:8089
 Restart=always
 
 [Install]
