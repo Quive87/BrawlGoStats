@@ -1,0 +1,12 @@
+[Unit]
+Description=BrawlGo Data Fetcher (Go)
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/var/www/BrawlGoStats/worker
+ExecStart=/var/www/BrawlGoStats/worker/worker
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

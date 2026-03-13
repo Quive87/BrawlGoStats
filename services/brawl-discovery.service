@@ -1,0 +1,12 @@
+[Unit]
+Description=BrawlGo Player Discovery
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/var/www/BrawlGoStats
+ExecStart=/usr/bin/python3 discovery_scraper.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
