@@ -137,6 +137,7 @@ func fetchUnprocessedTags(db *sql.DB, limit int) []string {
 type PlayerInfo struct {
 	Tag  string `json:"tag"`
 	Name string `json:"name"`
+	// Standard brawler object
 	Brawler struct {
 		ID       int    `json:"id"`
 		Name     string `json:"name"`
@@ -147,6 +148,14 @@ type PlayerInfo struct {
 			Name string `json:"name"`
 		} `json:"skin"`
 	} `json:"brawler"`
+	// Duels: multiple brawlers
+	Brawlers []struct {
+		ID           int    `json:"id"`
+		Name         string `json:"name"`
+		Power        int    `json:"power"`
+		Trophies     int    `json:"trophies"`
+		TrophyChange int    `json:"trophyChange"`
+	} `json:"brawlers"`
 	TrophyChange int    `json:"trophyChange"`
 	Result       string `json:"-"`
 	IsWinner     int    `json:"-"`
@@ -226,78 +235,91 @@ func processSnowball(data BattleLogResponse, out chan<- Payload) {
 			mode = item.Battle.Mode
 		}
 
-		// Determine winner
+		// Determine base winner team (for 3v3)
 		winnerTeam := -1
-		switch item.Battle.Result {
-		case "victory":
+		if item.Battle.Result == "victory" {
 			winnerTeam = 0
-			item.Battle.Result = "victory"
-		case "defeat":
+		} else if item.Battle.Result == "defeat" {
 			winnerTeam = 1
-			item.Battle.Result = "defeat"
 		}
 
-		var matchPlayers []PlayerInfo
-		var allTags []string
+		var playersToProcess []PlayerInfo
 
+		// 1. Process Teams (3v3 / Duo Showdown)
 		for i, team := range item.Battle.Teams {
-			for idx := range team {
-				team[idx].TeamID = i
-				if i == winnerTeam {
-					team[idx].IsWinner = 1
-					team[idx].Result = "victory"
+			for _, p := range team {
+				p.TeamID = i
+				// Win Condition: 3v3 Result or Duo Rank 1-2
+				if i == winnerTeam || (item.Battle.Mode == "duoShowdown" && item.Battle.Rank <= 2) {
+					p.IsWinner = 1
+					p.Result = "victory"
 				} else {
-					team[idx].IsWinner = 0
-					team[idx].Result = "defeat"
+					p.IsWinner = 0
+					p.Result = "defeat"
 				}
-				allTags = append(allTags, team[idx].Tag)
+				playersToProcess = append(playersToProcess, p)
 			}
-			matchPlayers = append(matchPlayers, team...)
 		}
 
-		for idx := range item.Battle.Players {
-			item.Battle.Players[idx].TeamID = 0
-			if item.Battle.Result == "victory" || item.Battle.Rank <= 4 {
-				item.Battle.Players[idx].IsWinner = 1
-				item.Battle.Players[idx].Result = "victory"
+		// 2. Process Players (Solo Showdown / Duels)
+		for _, p := range item.Battle.Players {
+			p.TeamID = 0
+			// Win Condition: Solo Showdown Rank 1-4 or Duels victory
+			if (item.Battle.Mode == "soloShowdown" && item.Battle.Rank <= 4) || item.Battle.Result == "victory" {
+				p.IsWinner = 1
+				p.Result = "victory"
 			} else {
-				item.Battle.Players[idx].Result = "defeat"
+				p.IsWinner = 0
+				p.Result = "defeat"
 			}
-			allTags = append(allTags, item.Battle.Players[idx].Tag)
+			playersToProcess = append(playersToProcess, p)
 		}
-		matchPlayers = append(matchPlayers, item.Battle.Players...)
 
-		// 100% Unique Match ID Implementation
-		// Include Event ID and Duration to prevent collisions on same-time matches
+		// Sort tags for deterministic Match ID
+		var allTags []string
+		for _, p := range playersToProcess {
+			if len(p.Tag) >= 2 {
+				allTags = append(allTags, p.Tag)
+			}
+		}
 		sort.Strings(allTags)
 		allTagsStr := strings.Join(allTags, ",")
 		matchID := fmt.Sprintf("%s-%x", item.BattleTime, sha1.Sum([]byte(fmt.Sprintf("%s|%d|%d|%s", allTagsStr, item.Event.ID, item.Battle.Duration, item.Event.Map))))
 
-		// 1. Snowball Discovery: Always collect tags from EVERY match
-		for _, p := range matchPlayers {
-			if len(p.Tag) >= 2 {
-				discoveredTags[p.Tag] = true
+		// 3. Snowball and Output
+		for _, p := range playersToProcess {
+			cleanTag := strings.TrimPrefix(p.Tag, "#")
+			cleanTag = strings.ToUpper(cleanTag)
+			if cleanTag == "" {
+				continue
 			}
-		}
 
-		// 2. Selective Storage: Only save matches from today
-		if isToday {
-			// Normalize Star Player Tag
-			starPlayerTag := strings.TrimPrefix(item.Battle.StarPlayer.Tag, "#")
-			starPlayerTag = strings.ToUpper(starPlayerTag)
+			discoveredTags[cleanTag] = true
 
-			out <- Payload{Match: []any{matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Event.ID, item.Battle.Duration, starPlayerTag, item.Event.ID}}
-
-			for _, p := range matchPlayers {
-				if len(p.Tag) < 2 {
-					continue
-				}
-				// Normalize Tag
-				cleanTag := strings.TrimPrefix(p.Tag, "#")
-				cleanTag = strings.ToUpper(cleanTag)
-
-				out <- Payload{Player: []any{matchID, cleanTag, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.Brawler.Skin.ID, p.IsWinner, p.TeamID, p.TrophyChange, p.Result}}
+			if isToday {
+				// Base Match Info
+				starPlayerTag := strings.TrimPrefix(item.Battle.StarPlayer.Tag, "#")
+				starPlayerTag = strings.ToUpper(starPlayerTag)
+				out <- Payload{Match: []any{matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Event.ID, item.Battle.Duration, starPlayerTag, item.Event.ID}}
 				out <- Payload{Upsert: []any{cleanTag, p.Name}}
+
+				// Handle Multiple Brawlers (Duels)
+				if len(p.Brawlers) > 0 {
+					for _, b := range p.Brawlers {
+						out <- Payload{Player: []any{
+							matchID, cleanTag, b.Name, b.ID, b.Power, b.Trophies,
+							"", 0, // Skin unknown in some Duels logs
+							p.IsWinner, p.TeamID, b.TrophyChange, p.Result,
+						}}
+					}
+				} else {
+					// Standard Single Brawler
+					out <- Payload{Player: []any{
+						matchID, cleanTag, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies,
+						p.Brawler.Skin.Name, p.Brawler.Skin.ID,
+						p.IsWinner, p.TeamID, p.TrophyChange, p.Result,
+					}}
+				}
 			}
 		}
 	}

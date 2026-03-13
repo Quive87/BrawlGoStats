@@ -57,6 +57,43 @@ def migrate():
         print(f"Error during players migration: {e}")
 
     try:
+        print("Migrating 'match_players' to support Duels (multiple brawlers)...")
+        # Check current PK
+        cursor.execute("PRAGMA table_info(match_players);")
+        columns = cursor.fetchall()
+        # [id, name, type, notnull, dflt_value, pk]
+        pk_count = sum(1 for col in columns if col[5] > 0)
+        
+        if pk_count < 3:
+            print("Changing Primary Key for 'match_players'...")
+            cursor.execute("ALTER TABLE match_players RENAME TO match_players_old;")
+            cursor.execute("""
+                CREATE TABLE match_players (
+                    match_id TEXT,
+                    player_tag TEXT,
+                    brawler_name TEXT,
+                    brawler_id INTEGER,
+                    brawler_power INTEGER,
+                    brawler_trophies INTEGER,
+                    skin_name TEXT,
+                    skin_id INTEGER,
+                    is_winner INTEGER DEFAULT 0,
+                    team_id INTEGER,
+                    trophy_change INTEGER,
+                    result TEXT,
+                    PRIMARY KEY (match_id, player_tag, brawler_id)
+                )
+            """)
+            cursor.execute("""
+                INSERT OR IGNORE INTO match_players 
+                SELECT * FROM match_players_old;
+            """)
+            cursor.execute("DROP TABLE match_players_old;")
+            print("Successfully updated 'match_players' Primary Key.")
+    except Exception as e:
+        print(f"Error migrating match_players: {e}")
+
+    try:
         print("Creating 'brawler_build_stats' table...")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS brawler_build_stats (

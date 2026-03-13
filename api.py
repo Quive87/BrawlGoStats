@@ -188,6 +188,9 @@ def get_player_battlelog(
     matches_map = {}
     for row in all_data:
         mid = row["match_id"]
+        tag = row["player_tag"]
+        mode = row["mode"].lower()
+        
         if mid not in matches_map:
             matches_map[mid] = {
                 "battleTime": row["battle_time"],
@@ -202,40 +205,101 @@ def get_player_battlelog(
                     "starPlayer": {"tag": "#" + row["star_player_tag"]} if row["star_player_tag"] else None,
                     "teams": [],
                     "players": []
-                }
+                },
+                "_players_index": {} # Internal helper to group brawlers for Duels
             }
         
-        player_obj = {
-            "tag": "#" + row["player_tag"],
-            "name": row["player_name"],
-            "brawler": {
-                "id": row["brawler_id"],
-                "name": row["brawler_name"],
-                "power": row["brawler_power"],
-                "trophies": row["brawler_trophies"],
-                "skin": {"id": row["skin_id"], "name": row["skin_name"]}
-            },
-            "trophyChange": row["trophy_change"],
-            "result": row["result"]
-        }
+        m = matches_map[mid]
         
-        mode = row["mode"].lower()
-        if "showdown" in mode:
-            # Showdown uses flat 'players' array
-            matches_map[mid]["battle"]["players"].append(player_obj)
+        # Brawler object for this row
+        brawler_obj = {
+            "id": row["brawler_id"],
+            "name": row["brawler_name"],
+            "power": row["brawler_power"],
+            "trophies": row["brawler_trophies"],
+            "trophyChange": row["trophy_change"],
+            "skin": {"id": row["skin_id"], "name": row["skin_name"]}
+        }
+
+        if tag not in m["_players_index"]:
+            player_obj = {
+                "tag": "#" + tag,
+                "name": row["player_name"],
+                "result": row["result"]
+            }
+            
+            if mode == "duels":
+                player_obj["brawlers"] = [brawler_obj]
+            else:
+                player_obj["brawler"] = brawler_obj
+                player_obj["trophyChange"] = row["trophy_change"]
+            
+            m["_players_index"][tag] = player_obj
+            
+            # Place in teams vs players
+            if mode == "soloshowdown" or mode == "solo showdown":
+                m["battle"]["players"].append(player_obj)
+            else:
+                # 3v3 / Duels / Duo Showdown use 'teams'
+                team_id = row["team_id"] or 0
+                while len(m["battle"]["teams"]) <= team_id:
+                    m["battle"]["teams"].append([])
+                m["battle"]["teams"][team_id].append(player_obj)
         else:
-            # 3v3 / Duels use 'teams' array of arrays
-            team_id = row["team_id"]
-            # Ensure outer list has enough slots
-            while len(matches_map[mid]["battle"]["teams"]) <= team_id:
-                matches_map[mid]["battle"]["teams"].append([])
-            matches_map[mid]["battle"]["teams"][team_id].append(player_obj)
+            # Player already exists (Duels) - just add the brawler
+            if mode == "duels":
+                m["_players_index"][tag]["brawlers"].append(brawler_obj)
 
-    # Convert map to sorted list
-    items = list(matches_map.values())
+    # Convert map to sorted list and clean up internal index
+    items = []
+    for mid in matches_map:
+        m = matches_map[mid]
+        del m["_players_index"]
+        items.append(m)
+        
     items.sort(key=lambda x: x["battleTime"], reverse=True)
-
+    
+    # 4. Enrichment: Calculate missing trophy changes
+    from trophy_logic import calculate_trophy_change
+    for item in items:
+        # We only enrich the player's own battle object if trophyChange is 0 or None
+        # and it's a 'ranked' type match
+        if item["battle"].get("type") != "ranked":
+            continue
+            
+        # Re-traverse to find the main player's object
+        players_to_check = item["battle"]["players"]
+        for team in item["battle"]["teams"]:
+            players_to_check.extend(team)
+            
+        for p in players_to_check:
+            if p["tag"].replace("#", "") == tag:
+                # If trophy change is missing, attempt to calculate
+                # Note: This is a best-effort prediction
+                if not p.get("trophyChange") or p["trophyChange"] == 0:
+                    tc = calculate_trophy_change(
+                        item["battle"]["mode"],
+                        p["brawler"]["trophies"],
+                        rank=item["battle"].get("rank"),
+                        result=p.get("result")
+                    )
+                    if tc != 0:
+                        p["trophyChange"] = tc
+    
     return {"items": items}
+
+@app.get("/meta/trophy-table", summary="Get Trophy Change Brackets")
+def get_trophy_table():
+    """Returns the full trophy change ruleset used for predictions."""
+    import trophy_logic
+    return {
+        "solo": {str(k): v for k, v in trophy_logic.SOLO_SHOWDOWN.items()},
+        "duo": {str(k): v for k, v in trophy_logic.DUO_SHOWDOWN.items()},
+        "trio": {str(k): v for k, v in trophy_logic.TRIO_MODES.items()},
+        "team": {str(k): v for k, v in trophy_logic.TEAM_MODES.items()},
+        "duels": {str(k): v for k, v in trophy_logic.DUELS.items()},
+        "arena": {str(k): v for k, v in trophy_logic.BRAWL_ARENA.items()}
+    }
 
 @app.get("/search", summary="Search Players by Name")
 def search_player_by_name(name: str = Query(..., examples=["Pika"])):
@@ -255,11 +319,13 @@ def search_player_by_name(name: str = Query(..., examples=["Pika"])):
     """
     try:
         # Sanitize query: FTS5 MATCH can be sensitive to special characters
-        clean_name = name.strip()
-        if not clean_name:
+        # Wrap the string in double quotes and escape internal quotes for safe FTS5 execution
+        clean_name = name.strip().replace('"', '""')
+        safe_name = f'"{clean_name}"'
+        if not name.strip():
             return []
             
-        players = conn.execute(query, (clean_name,)).fetchall()
+        players = conn.execute(query, (safe_name,)).fetchall()
         
         # Fallback to LIKE if FTS5 returns no results
         if not players and len(clean_name) >= 2:
