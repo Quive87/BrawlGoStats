@@ -27,6 +27,13 @@ const (
 	batchLoadSize = 1000 // Larger batch to reduce DB contention
 )
 
+type Payload struct {
+	Match  []interface{} // Match data args: match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id
+	Player []interface{} // Match_Player data args: match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, skin_id, is_winner, team_id, trophy_change, result
+	Upsert []interface{} // Player upsert args
+	NewTag string
+}
+
 var (
 	tagsProcessed uint64
 	rateLimitsHit uint64
@@ -63,10 +70,16 @@ func main() {
 		Timeout: 10 * time.Second,
 	}
 
+	// Start DB Writer
+	dbWriterChan := make(chan Payload, 5000)
+	var dbWg sync.WaitGroup
+	dbWg.Add(1)
+	go databaseWriter(db, dbWriterChan, &dbWg)
+
 	// Start concurrent workers
 	for w := 1; w <= poolSize; w++ {
 		wg.Add(1)
-		go worker(jobs, &wg, client, apiToken, db)
+		go worker(jobs, &wg, client, apiToken, dbWriterChan, db)
 	}
 
 	// Start Metrics Reporter
@@ -84,6 +97,8 @@ func main() {
 			fmt.Println("Shutting down...")
 			close(jobs)
 			wg.Wait()
+			close(dbWriterChan)
+			dbWg.Wait()
 			return
 		default:
 			// Fill the jobs queue if it's running low (Reduce starvation)
@@ -120,9 +135,9 @@ func fetchUnprocessedTags(db *sql.DB, limit int) []string {
 }
 
 type PlayerInfo struct {
-	Tag     string `json:"tag"`
-	Name    string `json:"name"`
-	Icon    struct {
+	Tag  string `json:"tag"`
+	Name string `json:"name"`
+	Icon struct {
 		ID int `json:"id"`
 	} `json:"icon"`
 	Brawler struct {
@@ -131,11 +146,14 @@ type PlayerInfo struct {
 		Power    int    `json:"power"`
 		Trophies int    `json:"trophies"`
 		Skin     struct {
+			ID   int    `json:"id"`
 			Name string `json:"name"`
 		} `json:"skin"`
 	} `json:"brawler"`
-	IsWinner int `json:"-"`
-	TeamID   int `json:"-"`
+	TrophyChange int    `json:"trophyChange"`
+	Result       string `json:"-"`
+	IsWinner     int    `json:"-"`
+	TeamID       int    `json:"-"`
 }
 
 type BattleEntry struct {
@@ -146,11 +164,11 @@ type BattleEntry struct {
 		Map  string `json:"map"`
 	} `json:"event"`
 	Battle struct {
-		Mode       string         `json:"mode"`
-		Type       string         `json:"type"`
-		Result     string         `json:"result"`
-		Duration   int            `json:"duration"`
-		Rank       int            `json:"rank"`
+		Mode       string `json:"mode"`
+		Type       string `json:"type"`
+		Result     string `json:"result"`
+		Duration   int    `json:"duration"`
+		Rank       int    `json:"rank"`
 		StarPlayer struct {
 			Tag string `json:"tag"`
 		} `json:"starPlayer"`
@@ -163,7 +181,8 @@ type BattleLogResponse struct {
 	Items []BattleEntry `json:"items"`
 }
 
-func worker(jobs <-chan string, wg *sync.WaitGroup, client *http.Client, token string, db *sql.DB) {
+
+func worker(jobs <-chan string, wg *sync.WaitGroup, client *http.Client, token string, out chan<- Payload, db *sql.DB) {
 	defer wg.Done()
 
 	for tag := range jobs {
@@ -186,7 +205,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, client *http.Client, token s
 			body, _ := io.ReadAll(resp.Body)
 			var logData BattleLogResponse
 			if err := json.Unmarshal(body, &logData); err == nil {
-				processSnowball(logData, db)
+				processSnowball(logData, out)
 			}
 			// Mark as processed
 			_, _ = db.Exec("UPDATE players SET is_processed = 1 WHERE tag = ?", tag)
@@ -198,30 +217,13 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, client *http.Client, token s
 	}
 }
 
-func processSnowball(data BattleLogResponse, db *sql.DB) {
+func processSnowball(data BattleLogResponse, out chan<- Payload) {
 	today := time.Now().UTC().Format("20060102")
 	discoveredTags := make(map[string]bool)
 
-	tx, err := db.Begin()
-	if err != nil {
-		return
-	}
-	defer tx.Rollback()
-
-	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, is_winner, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-	stmtUpsertPlayer, _ := tx.Prepare(`
-		INSERT INTO players (tag, name, icon_id) 
-		VALUES (?, ?, ?) 
-		ON CONFLICT(tag) DO UPDATE SET 
-			name = excluded.name, 
-			icon_id = excluded.icon_id 
-		WHERE name IS NULL OR icon_id IS NULL OR name = ''
-	`)
-
 	for _, item := range data.Items {
 		isToday := strings.HasPrefix(item.BattleTime, today)
-		
+
 		mode := item.Event.Mode
 		if mode == "" {
 			mode = item.Battle.Mode
@@ -232,8 +234,10 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 		switch item.Battle.Result {
 		case "victory":
 			winnerTeam = 0
+			item.Battle.Result = "victory"
 		case "defeat":
 			winnerTeam = 1
+			item.Battle.Result = "defeat"
 		}
 
 		var matchPlayers []PlayerInfo
@@ -244,28 +248,33 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 				team[idx].TeamID = i
 				if i == winnerTeam {
 					team[idx].IsWinner = 1
+					team[idx].Result = "victory"
 				} else {
 					team[idx].IsWinner = 0
+					team[idx].Result = "defeat"
 				}
 				allTags = append(allTags, team[idx].Tag)
 			}
 			matchPlayers = append(matchPlayers, team...)
 		}
-		
+
 		for idx := range item.Battle.Players {
 			item.Battle.Players[idx].TeamID = 0
 			if item.Battle.Result == "victory" || item.Battle.Rank <= 4 {
 				item.Battle.Players[idx].IsWinner = 1
+				item.Battle.Players[idx].Result = "victory"
+			} else {
+				item.Battle.Players[idx].Result = "defeat"
 			}
 			allTags = append(allTags, item.Battle.Players[idx].Tag)
 		}
 		matchPlayers = append(matchPlayers, item.Battle.Players...)
 
 		// 100% Unique Match ID Implementation
-		// Sort tags alphabetically to ensure consistent hash regardless of player order
+		// Include Event ID and Duration to prevent collisions on same-time matches
 		sort.Strings(allTags)
 		allTagsStr := strings.Join(allTags, ",")
-		matchID := fmt.Sprintf("%s-%x", item.BattleTime, sha1.Sum([]byte(allTagsStr+item.Event.Map)))
+		matchID := fmt.Sprintf("%s-%x", item.BattleTime, sha1.Sum([]byte(fmt.Sprintf("%s|%d|%d|%s", allTagsStr, item.Event.ID, item.Battle.Duration, item.Event.Map))))
 
 		// 1. Snowball Discovery: Always collect tags from EVERY match
 		for _, p := range matchPlayers {
@@ -280,7 +289,7 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 			starPlayerTag := strings.TrimPrefix(item.Battle.StarPlayer.Tag, "#")
 			starPlayerTag = strings.ToUpper(starPlayerTag)
 
-			_, _ = stmtMatch.Exec(matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Event.ID, item.Battle.Duration, starPlayerTag)
+			out <- Payload{Match: []any{matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Event.ID, item.Battle.Duration, starPlayerTag, item.Event.ID}}
 
 			for _, p := range matchPlayers {
 				if len(p.Tag) < 2 {
@@ -289,27 +298,89 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 				// Normalize Tag
 				cleanTag := strings.TrimPrefix(p.Tag, "#")
 				cleanTag = strings.ToUpper(cleanTag)
-				
-				_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
-				_, _ = stmtUpsertPlayer.Exec(cleanTag, p.Name, p.Icon.ID)
+
+				out <- Payload{Player: []any{matchID, cleanTag, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.Brawler.Skin.ID, p.IsWinner, p.TeamID, p.TrophyChange, p.Result}}
+				out <- Payload{Upsert: []any{cleanTag, p.Name, p.Icon.ID}}
 			}
 		}
 	}
-	stmtMatch.Close()
-	stmtPlayer.Close()
-	stmtUpsertPlayer.Close()
 
 	if len(discoveredTags) > 0 {
-		stmtNewTag, _ := tx.Prepare("INSERT OR IGNORE INTO players (tag) VALUES (?)")
 		for t := range discoveredTags {
 			cleanTag := strings.TrimPrefix(t, "#")
 			cleanTag = strings.ToUpper(cleanTag)
-			_, _ = stmtNewTag.Exec(cleanTag)
+			out <- Payload{NewTag: cleanTag}
 		}
-		stmtNewTag.Close()
+	}
+}
+
+// Single goroutine that batches DB writes to prevent SQL locks
+func databaseWriter(db *sql.DB, in <-chan Payload, wg *sync.WaitGroup) {
+	defer wg.Done()
+	var batch []Payload
+	ticker := time.NewTicker(2 * time.Second) // Commit every 2 seconds or 500 records
+	defer ticker.Stop()
+
+	for {
+		select {
+		case p, ok := <-in:
+			if !ok {
+				flushBatch(db, batch)
+				return
+			}
+			batch = append(batch, p)
+			if len(batch) >= 500 { // Bulk insert threshold
+				flushBatch(db, batch)
+				batch = batch[:0]
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				flushBatch(db, batch)
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+func flushBatch(db *sql.DB, batch []Payload) {
+	tx, err := db.Begin()
+	if err != nil {
+		fmt.Printf("TX Begin Error: %v\n", err)
+		return
 	}
 
-	tx.Commit()
+	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, skin_id, is_winner, team_id, trophy_change, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	stmtUpsert, _ := tx.Prepare(`
+		INSERT INTO players (tag, name, icon_id) 
+		VALUES (?, ?, ?) 
+		ON CONFLICT(tag) DO UPDATE SET 
+			name = excluded.name, 
+			icon_id = excluded.icon_id 
+		WHERE name IS NULL OR icon_id IS NULL OR name = ''
+	`)
+	stmtNewTag, _ := tx.Prepare("INSERT OR IGNORE INTO players (tag) VALUES (?)")
+
+	for _, p := range batch {
+		if p.Match != nil {
+			_, _ = stmtMatch.Exec(p.Match...)
+		}
+		if p.Player != nil {
+			_, _ = stmtPlayer.Exec(p.Player...)
+		}
+		if p.Upsert != nil {
+			_, _ = stmtUpsert.Exec(p.Upsert...)
+		}
+		if p.NewTag != "" {
+			_, _ = stmtNewTag.Exec(p.NewTag)
+		}
+	}
+
+	_ = stmtMatch.Close()
+	_ = stmtPlayer.Close()
+	_ = stmtUpsert.Close()
+	_ = stmtNewTag.Close()
+	_ = tx.Commit()
 }
 
 func reporter() {

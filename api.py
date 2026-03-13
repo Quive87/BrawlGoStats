@@ -11,6 +11,7 @@ import requests
 from typing import List, Optional
 from datetime import datetime
 from cachetools import cached, TTLCache
+from fastapi import BackgroundTasks
 
 app = FastAPI(
     title="BrawlGo Engine",
@@ -170,7 +171,7 @@ def get_player_battlelog(
         
     match_ids = [row["match_id"] for row in match_ids_rows]
     
-    # 2. Fetch all participants and match metadata for these matches (JOIN with players for names)
+    # 2. Fetch all participants and match metadata for these matches
     placeholders = ",".join(["?"] * len(match_ids))
     query = f"""
         SELECT m.*, mp.*, p.name as player_name
@@ -211,8 +212,11 @@ def get_player_battlelog(
                 "id": row["brawler_id"],
                 "name": row["brawler_name"],
                 "power": row["brawler_power"],
-                "trophies": row["brawler_trophies"]
-            }
+                "trophies": row["brawler_trophies"],
+                "skin": {"id": row["skin_id"], "name": row["skin_name"]}
+            },
+            "trophyChange": row["trophy_change"],
+            "result": row["result"]
         }
         
         mode = row["mode"].lower()
@@ -298,47 +302,42 @@ def get_best_brawlers(
     - map_name filters down to a specific map rotation.
     """
     conn = get_db()
-    query = """
+    
+    # Helper for consistent filtering
+    def build_meta_query(base_select):
+        conditions = []
+        params = []
+        if mode:
+            conditions.append("m.mode = ?")
+            params.append(mode)
+        if map_name:
+            conditions.append("m.map = ?")
+            params.append(map_name)
+        if match_type:
+            conditions.append("m.type = ?")
+            params.append(match_type)
+            if match_type == "ranked":
+                if min_trophies is not None:
+                    conditions.append("mp.brawler_trophies >= ?")
+                    params.append(min_trophies)
+                if max_trophies is not None:
+                    conditions.append("mp.brawler_trophies <= ?")
+                    params.append(max_trophies)
+            if match_type == "soloRanked" and league:
+                r_start, r_end = LEAGUE_MAPPING[league]
+                conditions.append("mp.brawler_trophies BETWEEN ? AND ?")
+                params.extend([r_start, r_end])
+        
+        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+        return base_select + where_clause, params
+
+    query, params = build_meta_query("""
         SELECT brawler_name, brawler_id, COUNT(*) as pick_count, 
         AVG(brawler_trophies) as avg_stat
         FROM match_players mp
         JOIN matches m ON mp.match_id = m.match_id
-    """
-    params = []
-    conditions = []
-    
-    if mode:
-        conditions.append("m.mode = ?")
-        params.append(mode)
-        
-    if map_name:
-        conditions.append("m.map = ?")
-        params.append(map_name)
-
-    if match_type:
-        conditions.append("m.type = ?")
-        params.append(match_type)
-        
-        # Ladder specific filters
-        if match_type == "ranked":
-            if min_trophies is not None:
-                conditions.append("mp.brawler_trophies >= ?")
-                params.append(min_trophies)
-            if max_trophies is not None:
-                conditions.append("mp.brawler_trophies <= ?")
-                params.append(max_trophies)
-        
-        # Ranked Mode specific filters (League based on ID mapping)
-        # Note: In soloRanked, 'brawler_trophies' holds the League ID (1-22)
-        if match_type == "soloRanked" and league:
-            range_start, range_end = LEAGUE_MAPPING[league]
-            conditions.append("mp.brawler_trophies BETWEEN ? AND ?")
-            params.extend([range_start, range_end])
-            
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-    
-    query += f" GROUP BY brawler_name ORDER BY pick_count DESC LIMIT {limit}"
+    """)
+    query += f" GROUP BY brawler_id ORDER BY pick_count DESC LIMIT {limit}"
     
     results = conn.execute(query, params).fetchall()
     conn.close()
@@ -361,6 +360,44 @@ def get_best_brawlers(
         ranked_data.append(data)
         
     return ranked_data
+
+@app.get("/meta/brawlers/winrate", summary="Brawler Win Rate Meta")
+@cached(cache_5m)
+def get_brawler_winrates(
+    mode: Optional[str] = None, 
+    map_name: Optional[str] = None,
+    match_type: Optional[str] = Query(None, enum=["ranked", "soloRanked"]),
+    limit: int = 150
+):
+    """Calculates actual win rates for brawlers based on the last 30 days of data."""
+    conn = get_db()
+    query = """
+        SELECT 
+            brawler_name, brawler_id,
+            COUNT(*) as total_games,
+            SUM(is_winner) as wins,
+            ROUND(CAST(SUM(is_winner) AS FLOAT) / COUNT(*) * 100, 1) as win_rate
+        FROM match_players mp
+        JOIN matches m ON mp.match_id = m.match_id
+        WHERE m.battle_time > datetime('now', '-30 days')
+    """
+    params = []
+    if mode:
+        query += " AND m.mode = ?"
+        params.append(mode)
+    if map_name:
+        query += " AND m.map = ?"
+        params.append(map_name)
+    if match_type:
+        query += " AND m.type = ?"
+        params.append(match_type)
+        
+    query += " GROUP BY brawler_id HAVING total_games >= 50 ORDER BY win_rate DESC LIMIT ?"
+    params.append(limit)
+    
+    results = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in results]
 
 @app.get("/meta/brawlers/trend", summary="Brawler Usage Trends (Daily)")
 @cached(cache_5m)
@@ -502,7 +539,63 @@ def get_map_rotation():
         print(f"Warning: Could not fetch map rotation metadata: {e}")
     return {"active": [], "upcoming": []}
 
-@app.get("/meta/builds/{brawler_name}", summary="Brawler Optimal Builds (Probabilistic)")
+@app.get("/meta/maps/list", summary="All Known Maps Catalog")
+def get_all_maps():
+    """Returns a list of all maps recorded in our database with their modes."""
+    conn = get_db()
+    results = conn.execute("""
+        SELECT map, mode, COUNT(*) as match_count 
+        FROM matches 
+        GROUP BY map, mode 
+        ORDER BY match_count DESC
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in results]
+
+@app.get("/meta/builds/{brawler_id}", summary="Get Brawler Meta Builds (O(1) Instant)")
+def get_brawler_builds_fast(brawler_id: int):
+    """
+    Returns aggregated build statistics for a brawler from the pre-computed 
+    brawler_build_stats table. This query is extremely fast (O(1)).
+    """
+    conn = get_db()
+    results = conn.execute("""
+        SELECT item_type, item_name, equip_count 
+        FROM brawler_build_stats 
+        WHERE brawler_id = ? 
+        ORDER BY equip_count DESC
+    """, (brawler_id,)).fetchall()
+    conn.close()
+    
+    # Restructure into categories
+    builds = {
+        "gadgets": [],
+        "starpowers": [],
+        "gears": [],
+        "hypercharges": []
+    }
+    
+    type_map = {
+        "gadget": "gadgets",
+        "starpower": "starpowers",
+        "gear": "gears",
+        "hypercharge": "hypercharges"
+    }
+
+    for row in results:
+        cat = type_map.get(row["item_type"])
+        if cat:
+            builds[cat].append({
+                "name": row["item_name"],
+                "count": row["equip_count"]
+            })
+            
+    return {
+        "brawler_id": brawler_id,
+        "builds": builds
+    }
+
+@app.get("/meta/builds/v1/{brawler_name}", summary="Brawler Optimal Builds (Probabilistic Legacy)")
 @cached(cache_1h)
 def get_brawler_builds(brawler_name: str = Path(..., examples=["SHELLY"]), sample_size: int = 5000):
     """
@@ -680,6 +773,109 @@ def get_map_analytics(map_name: str = Query(..., examples=["Pinhole Punt"], desc
         "top_teams": top_teams
     }
 
+@app.get("/meta/synergy/{brawler_id}", summary="Best Teammates for a Brawler")
+@cached(cache_1h)
+def get_brawler_synergy(brawler_id: int = Path(..., description="e.g., 16000000 for Shelly"), limit: int = 10):
+    """Calculates the highest win-rate teammates for a specific brawler."""
+    conn = get_db()
+    query = """
+        SELECT 
+            mp2.brawler_id as teammate_id,
+            mp2.brawler_name as teammate_name,
+            COUNT(*) as matches_played,
+            ROUND(CAST(SUM(mp1.is_winner) AS FLOAT) / COUNT(*) * 100, 1) as win_rate
+        FROM match_players mp1
+        JOIN match_players mp2 ON mp1.match_id = mp2.match_id AND mp1.team_id = mp2.team_id
+        WHERE mp1.brawler_id = ? AND mp2.brawler_id != ?
+        GROUP BY teammate_id
+        HAVING matches_played > 50
+        ORDER BY win_rate DESC
+        LIMIT ?
+    """
+    results = conn.execute(query, (brawler_id, brawler_id, limit)).fetchall()
+    conn.close()
+    return [dict(r) for r in results]
+
+@app.get("/meta/matchups/{brawler_id}", summary="Best Counters against a Brawler")
+@cached(cache_1h)
+def get_brawler_counters(brawler_id: int = Path(...)):
+    """Calculates which brawlers have the highest win rate AGAINST the target brawler."""
+    conn = get_db()
+    # mp1 = The target brawler, mp2 = the enemy brawlers
+    query = """
+        SELECT 
+            mp2.brawler_id as enemy_id,
+            mp2.brawler_name as enemy_name,
+            COUNT(*) as encounters,
+            ROUND(CAST(SUM(mp2.is_winner) AS FLOAT) / COUNT(*) * 100, 1) as enemy_win_rate_vs_target
+        FROM match_players mp1
+        JOIN match_players mp2 ON mp1.match_id = mp2.match_id AND mp1.team_id != mp2.team_id
+        WHERE mp1.brawler_id = ?
+        GROUP BY enemy_id
+        HAVING encounters > 50
+        ORDER BY enemy_win_rate_vs_target DESC
+        LIMIT 15
+    """
+    results = conn.execute(query, (brawler_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in results]
+
+@app.get("/player/{tag}/performance", summary="Recent Match Analytics")
+def get_player_performance(tag: str = Path(...)):
+    """Derives actual player skill and recent trends from their match history."""
+    clean_tag = tag.replace("#", "").upper()
+    conn = get_db()
+    
+    query = """
+        SELECT 
+            COUNT(*) as total_matches,
+            SUM(is_winner) as wins,
+            ROUND(CAST(SUM(is_winner) AS FLOAT) / COUNT(*) * 100, 1) as recent_win_rate,
+            AVG(duration) as avg_match_duration
+        FROM match_players mp
+        JOIN matches m ON mp.match_id = m.match_id
+        WHERE mp.player_tag = ?
+    """
+    stats = conn.execute(query, (clean_tag,)).fetchone()
+    
+    # Favorite brawler recently
+    fav_query = """
+        SELECT brawler_id, brawler_name, COUNT(*) as uses, SUM(is_winner) as wins
+        FROM match_players 
+        WHERE player_tag = ?
+        GROUP BY brawler_id
+        ORDER BY uses DESC LIMIT 3
+    """
+    favs = conn.execute(fav_query, (clean_tag,)).fetchall()
+    conn.close()
+
+    if not stats["total_matches"]:
+        return {"error": "Not enough recent match data"}
+
+    return {
+        "tag": f"#{clean_tag}",
+        "recent_win_rate": stats["recent_win_rate"],
+        "matches_analyzed": stats["total_matches"],
+        "avg_match_duration_seconds": round(stats["avg_match_duration"], 1) if stats["avg_match_duration"] else 0,
+        "most_played_recently": [dict(f) for f in favs]
+    }
+
+@app.get("/player/compare", summary="Compare Two Players")
+def compare_players(tag1: str, tag2: str):
+    """Returns a comparative analysis of two players' performance and brawler pools."""
+    p1 = get_player_performance(tag1)
+    p2 = get_player_performance(tag2)
+    
+    if "error" in p1 or "error" in p2:
+        return {"error": "One or both players have insufficient data for comparison"}
+        
+    return {
+        "player1": p1,
+        "player2": p2,
+        "winrate_diff": round(p1["recent_win_rate"] - p2["recent_win_rate"], 1)
+    }
+    
+            
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
