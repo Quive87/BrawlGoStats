@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Path
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -109,7 +109,7 @@ def health_check():
         conn.close()
 
 @app.get("/player/{tag}", summary="Get Player Profile")
-def get_player_profile(tag: str = Query(..., example="#P8CY9JGQR", description="Player tag with or without # token")):
+def get_player_profile(tag: str = Path(..., examples=["#P8CY9JGQR"], description="Player tag with or without # token")):
     """Returns the full player profile with decompressed brawler stats."""
     tag = tag.replace("#", "").upper()
     conn = get_db()
@@ -125,7 +125,7 @@ def get_player_profile(tag: str = Query(..., example="#P8CY9JGQR", description="
 
 @app.get("/battlelog/{tag}", summary="Get Processed Battle Log")
 def get_player_battlelog(
-    tag: str = Query(..., example="#P8CY9JGQR"), 
+    tag: str = Path(..., examples=["#P8CY9JGQR"]), 
     limit: int = Query(25, ge=1, le=100)
 ):
     """Returns the recent match history for a specific player."""
@@ -154,7 +154,7 @@ def get_player_battlelog(
     return {"tag": tag, "matches": [dict(m) for m in matches]}
 
 @app.get("/search", summary="Search Players by Name")
-def search_player_by_name(name: str = Query(..., example="Pika")):
+def search_player_by_name(name: str = Query(..., examples=["Pika"])):
     conn = get_db()
     players = conn.execute("SELECT tag, name, trophies FROM players WHERE name LIKE ? ORDER BY trophies DESC LIMIT 20", (f"%{name}%",)).fetchall()
     conn.close()
@@ -174,8 +174,8 @@ LEAGUE_MAPPING = {
 @app.get("/meta/brawlers", summary="Dynamic Brawler Meta Rankings")
 @cached(cache_5m)
 def get_best_brawlers(
-    mode: Optional[str] = Query(None, example="brawlBall"), 
-    map_name: Optional[str] = Query(None, example="Pinhole Punt"),
+    mode: Optional[str] = Query(None, examples=["brawlBall"]), 
+    map_name: Optional[str] = Query(None, examples=["Pinhole Punt"]),
     match_type: Optional[str] = Query(None, enum=["ranked", "soloRanked"]), 
     min_trophies: Optional[int] = Query(None, ge=0),
     max_trophies: Optional[int] = Query(None, le=1500),
@@ -395,7 +395,7 @@ def get_map_rotation():
 
 @app.get("/meta/builds/{brawler_name}", summary="Brawler Optimal Builds (Probabilistic)")
 @cached(cache_1h)
-def get_brawler_builds(brawler_name: str = Query(..., example="SHELLY"), sample_size: int = 5000):
+def get_brawler_builds(brawler_name: str = Path(..., examples=["SHELLY"]), sample_size: int = 5000):
     """
     Probabilistic Big Data Endpoint.
     Decompresses the Zstd profile blobs for 'sample_size' random active players to accurately 
@@ -471,7 +471,7 @@ def get_brawler_builds(brawler_name: str = Query(..., example="SHELLY"), sample_
 
 @app.get("/meta/maps", summary="Deep Map Meta Analysis")
 @cached(cache_1h)
-def get_map_analytics(map_name: str = Query(..., example="Pinhole Punt", description="e.g., 'Pinhole Punt'")):
+def get_map_analytics(map_name: str = Query(..., examples=["Pinhole Punt"], description="e.g., 'Pinhole Punt'")):
     """Returns deep performance analytics for a specific map: Best Picks, Most Used, and Top Teams."""
     conn = get_db()
     
