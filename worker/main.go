@@ -192,6 +192,7 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, client *http.Client, token s
 }
 
 func processSnowball(data BattleLogResponse, db *sql.DB) {
+	today := time.Now().UTC().Format("20060102")
 	discoveredTags := make(map[string]bool)
 
 	tx, err := db.Begin()
@@ -204,6 +205,8 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_power, brawler_trophies, skin_name, is_winner, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
 
 	for _, item := range data.Items {
+		isToday := strings.HasPrefix(item.BattleTime, today)
+		
 		// Consistent match ID across different scrapers
 		matchID := item.BattleTime + item.Event.Map + item.Battle.Mode
 		mode := item.Event.Mode
@@ -211,7 +214,7 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 			mode = item.Battle.Mode
 		}
 
-		// Determine winner (Team 0 is usually the player's team in Solo/Duo/3v3 results)
+		// Determine winner
 		winnerTeam := -1
 		switch item.Battle.Result {
 		case "victory":
@@ -219,12 +222,6 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 		case "defeat":
 			winnerTeam = 1
 		}
-
-		// Normalize Star Player Tag
-		starPlayerTag := strings.TrimPrefix(item.Battle.StarPlayer.Tag, "#")
-		starPlayerTag = strings.ToUpper(starPlayerTag)
-
-		_, _ = stmtMatch.Exec(matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Battle.Duration, starPlayerTag)
 
 		var matchPlayers []PlayerInfo
 		for i, team := range item.Battle.Teams {
@@ -239,25 +236,39 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 			matchPlayers = append(matchPlayers, team...)
 		}
 		
-		// For Solo/Duo modes where result handling is different
 		for idx := range item.Battle.Players {
 			item.Battle.Players[idx].TeamID = 0
-			if item.Battle.Result == "victory" || item.Battle.Rank <= 4 { // Top 4 in Duo = Win-ish 
+			if item.Battle.Result == "victory" || item.Battle.Rank <= 4 {
 				item.Battle.Players[idx].IsWinner = 1
 			}
 		}
 		matchPlayers = append(matchPlayers, item.Battle.Players...)
 
+		// 1. Snowball Discovery: Always collect tags from EVERY match
 		for _, p := range matchPlayers {
-			if len(p.Tag) < 2 {
-				continue
+			if len(p.Tag) >= 2 {
+				discoveredTags[p.Tag] = true
 			}
-			// Normalize Tag
-			cleanTag := strings.TrimPrefix(p.Tag, "#")
-			cleanTag = strings.ToUpper(cleanTag)
-			
-			_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Brawler.Name, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
-			discoveredTags[p.Tag] = true
+		}
+
+		// 2. Selective Storage: Only save matches from today
+		if isToday {
+			// Normalize Star Player Tag
+			starPlayerTag := strings.TrimPrefix(item.Battle.StarPlayer.Tag, "#")
+			starPlayerTag = strings.ToUpper(starPlayerTag)
+
+			_, _ = stmtMatch.Exec(matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Battle.Duration, starPlayerTag)
+
+			for _, p := range matchPlayers {
+				if len(p.Tag) < 2 {
+					continue
+				}
+				// Normalize Tag
+				cleanTag := strings.TrimPrefix(p.Tag, "#")
+				cleanTag = strings.ToUpper(cleanTag)
+				
+				_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Brawler.Name, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
+			}
 		}
 	}
 	stmtMatch.Close()
@@ -266,7 +277,8 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 	if len(discoveredTags) > 0 {
 		stmtNewTag, _ := tx.Prepare("INSERT OR IGNORE INTO players (tag) VALUES (?)")
 		for t := range discoveredTags {
-			cleanTag := t[1:] // Remove #
+			cleanTag := strings.TrimPrefix(t, "#")
+			cleanTag = strings.ToUpper(cleanTag)
 			_, _ = stmtNewTag.Exec(cleanTag)
 		}
 		stmtNewTag.Close()
