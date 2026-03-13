@@ -149,12 +149,13 @@ def get_player_battlelog(
         
     match_ids = [row["match_id"] for row in match_ids_rows]
     
-    # 2. Fetch all participants and match metadata for these matches
+    # 2. Fetch all participants and match metadata for these matches (JOIN with players for names)
     placeholders = ",".join(["?"] * len(match_ids))
     query = f"""
-        SELECT m.*, mp.*
+        SELECT m.*, mp.*, p.name as player_name
         FROM matches m
         JOIN match_players mp ON m.match_id = mp.match_id
+        LEFT JOIN players p ON mp.player_tag = p.tag
         WHERE m.match_id IN ({placeholders})
         ORDER BY m.battle_time DESC
     """
@@ -185,7 +186,6 @@ def get_player_battlelog(
         player_obj = {
             "tag": "#" + row["player_tag"],
             "name": row["player_name"],
-            "icon": {"id": row["icon_id"]} if row["icon_id"] else None,
             "brawler": {
                 "id": row["brawler_id"],
                 "name": row["brawler_name"],

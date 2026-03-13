@@ -209,7 +209,15 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 	defer tx.Rollback()
 
 	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, player_name, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, is_winner, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, is_winner, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	stmtUpsertPlayer, _ := tx.Prepare(`
+		INSERT INTO players (tag, name, icon_id) 
+		VALUES (?, ?, ?) 
+		ON CONFLICT(tag) DO UPDATE SET 
+			name = excluded.name, 
+			icon_id = excluded.icon_id 
+		WHERE name IS NULL OR icon_id IS NULL OR name = ''
+	`)
 
 	for _, item := range data.Items {
 		isToday := strings.HasPrefix(item.BattleTime, today)
@@ -282,12 +290,14 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 				cleanTag := strings.TrimPrefix(p.Tag, "#")
 				cleanTag = strings.ToUpper(cleanTag)
 				
-				_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Name, p.Icon.ID, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
+				_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
+				_, _ = stmtUpsertPlayer.Exec(cleanTag, p.Name, p.Icon.ID)
 			}
 		}
 	}
 	stmtMatch.Close()
 	stmtPlayer.Close()
+	stmtUpsertPlayer.Close()
 
 	if len(discoveredTags) > 0 {
 		stmtNewTag, _ := tx.Prepare("INSERT OR IGNORE INTO players (tag) VALUES (?)")

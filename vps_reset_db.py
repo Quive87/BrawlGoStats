@@ -1,38 +1,40 @@
 import sqlite3
 import os
+import shutil
 
-DB_PATH = "brawl_data.sqlite"
+DB_NAME = "brawl_data.sqlite"
 
-def upgrade_and_reset():
-    if not os.path.exists(DB_PATH):
-        print(f"Error: {DB_PATH} not found.")
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+def reset_database():
+    print("--- BrawlGo Security Reset Service ---")
     
-    print("Upgrading schema...")
-    try:
-        c.execute("ALTER TABLE matches ADD COLUMN map_id INTEGER")
-    except sqlite3.OperationalError:
-        print("Column map_id already exists.")
+    # 1. Ask for confirmation (simulated via script logic)
+    if os.path.exists(DB_NAME):
+        backup_name = f"{DB_NAME}.bak"
+        print(f"Creating backup: {backup_name}...")
+        shutil.copy2(DB_NAME, backup_name)
         
-    try:
-        c.execute("ALTER TABLE match_players ADD COLUMN brawler_id INTEGER")
-    except sqlite3.OperationalError:
-        print("Column brawler_id already exists.")
+        print("Stopping services (if manual)...")
+        # In a script, we assume the user stops services or we just handle the file.
+        
+        print(f"Wiping {DB_NAME}...")
+        os.remove(DB_NAME)
+        
+        # Also remove WAL files if they exist
+        if os.path.exists(f"{DB_NAME}-wal"): os.remove(f"{DB_NAME}-wal")
+        if os.path.exists(f"{DB_NAME}-shm"): os.remove(f"{DB_NAME}-shm")
+        
+        print("Database wiped successfully!")
+    else:
+        print("No database found to wipe.")
 
-    print("Resetting match data...")
-    c.execute("DELETE FROM matches")
-    c.execute("DELETE FROM match_players")
-    
-    conn.commit()
-    
-    print("Optimizing database (VACUUM)...")
-    conn.execute("VACUUM")
-    
-    conn.close()
-    print("Database upgrade and reset complete.")
+    print("\nNext Steps:")
+    print("1. Restart the Discovery Scraper: sudo systemctl start brawl-discovery")
+    print("2. It will recreate the schema automatically.")
+    print("3. Then start the worker: sudo systemctl start brawl-worker")
 
 if __name__ == "__main__":
-    upgrade_and_reset()
+    confirm = input("Are you SURE you want to wipe the database? This cannot be undone. (y/N): ")
+    if confirm.lower() == 'y':
+        reset_database()
+    else:
+        print("Reset cancelled.")
