@@ -186,6 +186,7 @@ def get_player_battlelog(
             "tag": "#" + row["player_tag"],
             "name": None, # Name not stored in match_players to save space
             "brawler": {
+                "id": row["brawler_id"],
                 "name": row["brawler_name"],
                 "power": row["brawler_power"],
                 "trophies": row["brawler_trophies"]
@@ -276,7 +277,7 @@ def get_best_brawlers(
     """
     conn = get_db()
     query = """
-        SELECT brawler_name, COUNT(*) as pick_count, 
+        SELECT brawler_name, brawler_id, COUNT(*) as pick_count, 
         AVG(brawler_trophies) as avg_stat
         FROM match_players mp
         JOIN matches m ON mp.match_id = m.match_id
@@ -418,7 +419,7 @@ def get_brawler_trend(
 @cached(cache_5m)
 def get_skin_popularity(brawler: Optional[str] = None):
     conn = get_db()
-    query = "SELECT brawler_name, skin_name, COUNT(*) as count FROM match_players WHERE skin_name IS NOT NULL"
+    query = "SELECT brawler_name, brawler_id, skin_name, COUNT(*) as count FROM match_players WHERE skin_name IS NOT NULL AND LENGTH(skin_name) > 0"
     params = []
     if brawler:
         query += " AND brawler_name = ?"

@@ -70,6 +70,7 @@ def setup_db():
             mode TEXT,
             type TEXT, -- soloRanked (Ranked Mode) or ranked (Ladder)
             map TEXT,
+            map_id INTEGER,
             duration INTEGER,
             star_player_tag TEXT
         )
@@ -83,6 +84,7 @@ def setup_db():
             match_id TEXT,
             player_tag TEXT,
             brawler_name TEXT,
+            brawler_id INTEGER,
             brawler_power INTEGER,
             brawler_trophies INTEGER,
             skin_name TEXT,
@@ -194,7 +196,7 @@ def scrape_leaderboards():
                 if "club" in p and "tag" in p["club"]:
                     club_tag = p["club"]["tag"].replace("#", "")
                     scrape_club_members(club_tag)
-        time.sleep(0.1)
+        time.sleep(2.0) # Throttled: 2.0s sleep instead of 0.1s
 
 def scrape_club_members(club_tag):
     """Fetches all 100 members of a club and adds them to DB. Snowball effect!"""

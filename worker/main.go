@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha1"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -121,6 +123,7 @@ type PlayerInfo struct {
 	Tag     string `json:"tag"`
 	Name    string `json:"name"`
 	Brawler struct {
+		ID       int    `json:"id"`
 		Name     string `json:"name"`
 		Power    int    `json:"power"`
 		Trophies int    `json:"trophies"`
@@ -135,6 +138,7 @@ type PlayerInfo struct {
 type BattleEntry struct {
 	BattleTime string `json:"battleTime"`
 	Event      struct {
+		ID   int    `json:"id"`
 		Mode string `json:"mode"`
 		Map  string `json:"map"`
 	} `json:"event"`
@@ -201,14 +205,12 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 	}
 	defer tx.Rollback()
 
-	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, duration, star_player_tag) VALUES (?, ?, ?, ?, ?, ?, ?)")
-	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_power, brawler_trophies, skin_name, is_winner, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, is_winner, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 
 	for _, item := range data.Items {
 		isToday := strings.HasPrefix(item.BattleTime, today)
 		
-		// Consistent match ID across different scrapers
-		matchID := item.BattleTime + item.Event.Map + item.Battle.Mode
 		mode := item.Event.Mode
 		if mode == "" {
 			mode = item.Battle.Mode
@@ -224,6 +226,8 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 		}
 
 		var matchPlayers []PlayerInfo
+		var allTags []string
+
 		for i, team := range item.Battle.Teams {
 			for idx := range team {
 				team[idx].TeamID = i
@@ -232,6 +236,7 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 				} else {
 					team[idx].IsWinner = 0
 				}
+				allTags = append(allTags, team[idx].Tag)
 			}
 			matchPlayers = append(matchPlayers, team...)
 		}
@@ -241,8 +246,15 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 			if item.Battle.Result == "victory" || item.Battle.Rank <= 4 {
 				item.Battle.Players[idx].IsWinner = 1
 			}
+			allTags = append(allTags, item.Battle.Players[idx].Tag)
 		}
 		matchPlayers = append(matchPlayers, item.Battle.Players...)
+
+		// 100% Unique Match ID Implementation
+		// Sort tags alphabetically to ensure consistent hash regardless of player order
+		sort.Strings(allTags)
+		allTagsStr := strings.Join(allTags, ",")
+		matchID := fmt.Sprintf("%s-%x", item.BattleTime, sha1.Sum([]byte(allTagsStr+item.Event.Map)))
 
 		// 1. Snowball Discovery: Always collect tags from EVERY match
 		for _, p := range matchPlayers {
@@ -257,7 +269,7 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 			starPlayerTag := strings.TrimPrefix(item.Battle.StarPlayer.Tag, "#")
 			starPlayerTag = strings.ToUpper(starPlayerTag)
 
-			_, _ = stmtMatch.Exec(matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Battle.Duration, starPlayerTag)
+			_, _ = stmtMatch.Exec(matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Event.ID, item.Battle.Duration, starPlayerTag)
 
 			for _, p := range matchPlayers {
 				if len(p.Tag) < 2 {
@@ -267,7 +279,7 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 				cleanTag := strings.TrimPrefix(p.Tag, "#")
 				cleanTag = strings.ToUpper(cleanTag)
 				
-				_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Brawler.Name, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
+				_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
 			}
 		}
 	}
