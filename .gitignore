@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+
+# Go
+worker/worker.exe
+worker/worker
+worker/workworker.exe
+
+# Database
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

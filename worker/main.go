@@ -1,0 +1,279 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/joho/godotenv"
+	_ "modernc.org/sqlite" // Pure Go SQLite (No CGO required)
+)
+
+const (
+	dbPath        = "../brawl_data.sqlite"
+	baseURL       = "https://api.brawlstars.com/v1"
+	poolSize      = 50  // Concurrent workers
+	batchLoadSize = 200 // Number of tags to pull from DB into memory at once
+)
+
+var (
+	tagsProcessed uint64
+	rateLimitsHit uint64
+	errorsHit     uint64
+)
+
+func main() {
+	_ = godotenv.Load("../.env")
+	apiToken := os.Getenv("SUPERCELL_API_TOKEN")
+	if apiToken == "" {
+		fmt.Println("ERROR: SUPERCELL_API_TOKEN not found in .env")
+		os.Exit(1)
+	}
+
+	// Connect to shared SQLite with WAL mode
+	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_sync=NORMAL")
+	if err != nil {
+		fmt.Printf("DB Connect Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	// Prep the job channel
+	jobs := make(chan string, batchLoadSize)
+	var wg sync.WaitGroup
+
+	// High-throughput HTTP client
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        poolSize,
+			MaxIdleConnsPerHost: poolSize,
+			IdleConnTimeout:     30 * time.Second,
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	// Start concurrent workers
+	for w := 1; w <= poolSize; w++ {
+		wg.Add(1)
+		go worker(jobs, &wg, client, apiToken, db)
+	}
+
+	// Start Metrics Reporter
+	go reporter()
+
+	fmt.Printf("--- Native High-Speed Worker Started (%d workers) --- \n", poolSize)
+
+	// Shutdown listener
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		select {
+		case <-sigchan:
+			fmt.Println("Shutting down...")
+			close(jobs)
+			wg.Wait()
+			return
+		default:
+			// Fill the jobs queue if it's running low
+			if len(jobs) < 10 {
+				tags := fetchUnprocessedTags(db, batchLoadSize)
+				if len(tags) == 0 {
+					time.Sleep(2 * time.Second) // Wait for Python scraper to find more
+					continue
+				}
+				for _, t := range tags {
+					jobs <- t
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
+func fetchUnprocessedTags(db *sql.DB, limit int) []string {
+	rows, err := db.Query("SELECT tag FROM players WHERE is_processed = 0 LIMIT ?", limit)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var tags []string
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err == nil {
+			tags = append(tags, tag)
+		}
+	}
+	return tags
+}
+
+type PlayerInfo struct {
+	Tag     string `json:"tag"`
+	Name    string `json:"name"`
+	Brawler struct {
+		Name     string `json:"name"`
+		Power    int    `json:"power"`
+		Trophies int    `json:"trophies"`
+		Skin     struct {
+			Name string `json:"name"`
+		} `json:"skin"`
+	} `json:"brawler"`
+	IsWinner int `json:"-"`
+	TeamID   int `json:"-"`
+}
+
+type BattleEntry struct {
+	BattleTime string `json:"battleTime"`
+	Event      struct {
+		Mode string `json:"mode"`
+		Map  string `json:"map"`
+	} `json:"event"`
+	Battle struct {
+		Mode       string         `json:"mode"`
+		Type       string         `json:"type"`
+		Result     string         `json:"result"`
+		Duration   int            `json:"duration"`
+		Rank       int            `json:"rank"`
+		StarPlayer struct {
+			Tag string `json:"tag"`
+		} `json:"starPlayer"`
+		Teams   [][]PlayerInfo `json:"teams"`
+		Players []PlayerInfo   `json:"players"`
+	} `json:"battle"`
+}
+
+type BattleLogResponse struct {
+	Items []BattleEntry `json:"items"`
+}
+
+func worker(jobs <-chan string, wg *sync.WaitGroup, client *http.Client, token string, db *sql.DB) {
+	defer wg.Done()
+
+	for tag := range jobs {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/players/%%23%s/battlelog", baseURL, tag), nil)
+		req.Header.Add("Authorization", "Bearer "+token)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			atomic.AddUint64(&errorsHit, 1)
+			continue
+		}
+
+		atomic.AddUint64(&tagsProcessed, 1)
+
+		switch resp.StatusCode {
+		case 429:
+			atomic.AddUint64(&rateLimitsHit, 1)
+			time.Sleep(5 * time.Second)
+		case 200:
+			body, _ := io.ReadAll(resp.Body)
+			var logData BattleLogResponse
+			if err := json.Unmarshal(body, &logData); err == nil {
+				processSnowball(logData, db)
+			}
+			// Mark as processed
+			_, _ = db.Exec("UPDATE players SET is_processed = 1 WHERE tag = ?", tag)
+		default:
+			atomic.AddUint64(&errorsHit, 1)
+		}
+
+		resp.Body.Close()
+	}
+}
+
+func processSnowball(data BattleLogResponse, db *sql.DB) {
+	discoveredTags := make(map[string]bool)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+
+	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, duration, star_player_tag) VALUES (?, ?, ?, ?, ?, ?, ?)")
+	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_power, brawler_trophies, skin_name, is_winner, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+
+	for _, item := range data.Items {
+		// Consistent match ID across different scrapers
+		matchID := item.BattleTime + item.Event.Map + item.Battle.Mode
+		mode := item.Event.Mode
+		if mode == "" {
+			mode = item.Battle.Mode
+		}
+
+		// Determine winner (Team 0 is usually the player's team in Solo/Duo/3v3 results)
+		winnerTeam := -1
+		switch item.Battle.Result {
+		case "victory":
+			winnerTeam = 0
+		case "defeat":
+			winnerTeam = 1
+		}
+
+		_, _ = stmtMatch.Exec(matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Battle.Duration, item.Battle.StarPlayer.Tag)
+
+		var matchPlayers []PlayerInfo
+		for i, team := range item.Battle.Teams {
+			for idx := range team {
+				team[idx].TeamID = i
+				if i == winnerTeam {
+					team[idx].IsWinner = 1
+				} else {
+					team[idx].IsWinner = 0
+				}
+			}
+			matchPlayers = append(matchPlayers, team...)
+		}
+		
+		// For Solo/Duo modes where result handling is different
+		for idx := range item.Battle.Players {
+			item.Battle.Players[idx].TeamID = 0
+			if item.Battle.Result == "victory" || item.Battle.Rank <= 4 { // Top 4 in Duo = Win-ish 
+				item.Battle.Players[idx].IsWinner = 1
+			}
+		}
+		matchPlayers = append(matchPlayers, item.Battle.Players...)
+
+		for _, p := range matchPlayers {
+			if len(p.Tag) < 2 {
+				continue
+			}
+			_, _ = stmtPlayer.Exec(matchID, p.Tag, p.Brawler.Name, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
+			discoveredTags[p.Tag] = true
+		}
+	}
+	stmtMatch.Close()
+	stmtPlayer.Close()
+
+	if len(discoveredTags) > 0 {
+		stmtNewTag, _ := tx.Prepare("INSERT OR IGNORE INTO players (tag) VALUES (?)")
+		for t := range discoveredTags {
+			cleanTag := t[1:] // Remove #
+			_, _ = stmtNewTag.Exec(cleanTag)
+		}
+		stmtNewTag.Close()
+	}
+
+	tx.Commit()
+}
+
+func reporter() {
+	ticker := time.NewTicker(5 * time.Second)
+	var lastProcessed uint64
+	for range ticker.C {
+		curr := atomic.LoadUint64(&tagsProcessed)
+		rate := (curr - lastProcessed) / 5
+		lastProcessed = curr
+		fmt.Printf("[NET %3d req/s] Total: %-6d | 429: %-4d | Errors: %-4d\n",
+			rate, curr, atomic.LoadUint64(&rateLimitsHit), atomic.LoadUint64(&errorsHit))
+	}
+}
