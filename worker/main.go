@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -219,7 +220,11 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 			winnerTeam = 1
 		}
 
-		_, _ = stmtMatch.Exec(matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Battle.Duration, item.Battle.StarPlayer.Tag)
+		// Normalize Star Player Tag
+		starPlayerTag := strings.TrimPrefix(item.Battle.StarPlayer.Tag, "#")
+		starPlayerTag = strings.ToUpper(starPlayerTag)
+
+		_, _ = stmtMatch.Exec(matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Battle.Duration, starPlayerTag)
 
 		var matchPlayers []PlayerInfo
 		for i, team := range item.Battle.Teams {
@@ -247,7 +252,11 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 			if len(p.Tag) < 2 {
 				continue
 			}
-			_, _ = stmtPlayer.Exec(matchID, p.Tag, p.Brawler.Name, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
+			// Normalize Tag
+			cleanTag := strings.TrimPrefix(p.Tag, "#")
+			cleanTag = strings.ToUpper(cleanTag)
+			
+			_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Brawler.Name, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
 			discoveredTags[p.Tag] = true
 		}
 	}
