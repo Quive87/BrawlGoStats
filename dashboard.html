@@ -31,25 +31,17 @@
             min-height: 100vh;
         }
 
-        .navbar {
-            border-bottom: 1px solid var(--accents-2);
-            padding: 16px 0;
-            background: #000;
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
-
         .container {
             max-width: 1000px;
             margin: 0 auto;
-            padding: 0 24px;
+            padding: 80px 24px;
         }
 
-        .nav-content {
+        .header-top {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            margin-bottom: 32px;
         }
 
         .logo {
@@ -57,13 +49,13 @@
             font-weight: 600;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 12px;
             letter-spacing: -0.02em;
         }
 
         .logo-icon {
             width: 20px;
-            height: 20px;
+            height: 17px;
             background: #fff;
             clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
         }
@@ -71,44 +63,45 @@
         .status-pill {
             display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 8px;
             font-size: 12px;
             color: var(--accents-5);
             padding: 4px 12px;
             border: 1px solid var(--accents-2);
             border-radius: 999px;
-            background: var(--accents-1);
+            background: var(--bg);
         }
 
         .status-dot {
-            width: 6px;
-            height: 6px;
+            width: 7px;
+            height: 7px;
             background: #00ff00;
             border-radius: 50%;
-            box-shadow: 0 0 8px #00ff00;
+            box-shadow: 0 0 10px rgba(0, 255, 0, 0.4);
         }
 
         .hero {
-            padding: 48px 0;
+            margin-bottom: 48px;
         }
 
         .title {
-            font-size: 32px;
-            font-weight: 700;
-            letter-spacing: -0.05em;
+            font-size: 48px;
+            font-weight: 800;
+            letter-spacing: -0.06em;
             margin-bottom: 8px;
+            line-height: 1;
         }
 
         .subtitle {
-            font-size: 14px;
+            font-size: 16px;
             color: var(--accents-5);
+            letter-spacing: -0.01em;
         }
 
         .grid {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 24px;
-            margin-top: 32px;
         }
 
         .card {
@@ -117,10 +110,11 @@
             padding: 24px;
             background: var(--bg);
             transition: border-color 0.15s ease;
+            position: relative;
         }
 
         .card:hover {
-            border-color: var(--accents-3);
+            border-color: var(--accents-5);
         }
 
         .card-label {
@@ -130,31 +124,28 @@
             text-transform: uppercase;
             letter-spacing: 0.05em;
             margin-bottom: 12px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
         }
 
         .card-value {
-            font-size: 24px;
+            font-size: 28px;
             font-weight: 700;
-            letter-spacing: -0.02em;
+            letter-spacing: -0.03em;
         }
 
         .card-subtext {
-            font-size: 12px;
+            font-size: 13px;
             color: var(--accents-5);
             margin-top: 4px;
         }
 
         .progress-wrapper {
-            margin-top: 16px;
+            margin-top: 20px;
         }
 
         .progress-bg {
-            height: 6px;
-            background: var(--accents-1);
-            border-radius: 3px;
+            height: 2px;
+            background: var(--accents-2);
+            border-radius: 1px;
             overflow: hidden;
         }
 
@@ -162,14 +153,24 @@
             height: 100%;
             background: var(--foreground);
             width: 0%;
-            transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+            transition: width 1.2s cubic-bezier(0.19, 1, 0.22, 1);
+        }
+
+        .footer {
+            margin-top: 100px;
+            border-top: 1px solid var(--accents-2);
+            padding: 40px 0;
+            color: var(--accents-5);
+            font-size: 13px;
+            display: flex;
+            justify-content: space-between;
         }
 
         .btn {
             display: inline-flex;
             align-items: center;
-            height: 32px;
-            padding: 0 12px;
+            height: 36px;
+            padding: 0 16px;
             font-size: 14px;
             font-weight: 500;
             border-radius: 6px;
@@ -191,50 +192,41 @@
         }
 
         .btn-black:hover {
-            border-color: var(--foreground);
-        }
-
-        .footer {
-            margin-top: 80px;
-            border-top: 1px solid var(--accents-2);
-            padding: 40px 0;
-            color: var(--accents-5);
-            font-size: 12px;
-            display: flex;
-            justify-content: space-between;
+            background: var(--accents-1);
+            border-color: var(--accents-5);
         }
 
         @media (max-width: 768px) {
             .grid { grid-template-columns: 1fr; }
+            .header-top { flex-direction: column; align-items: flex-start; gap: 16px; }
+            .title { font-size: 36px; }
         }
     </style>
 </head>
 <body>
-    <nav class="navbar">
-        <div class="container nav-content">
+    <main class="container">
+        <div class="header-top">
             <div class="logo">
                 <div class="logo-icon"></div>
                 BrawlGo
             </div>
             <div id="status-badge" class="status-pill">
                 <div class="status-dot"></div>
-                Engine Live
+                Initializing...
             </div>
         </div>
-    </nav>
 
-    <main class="container">
         <div class="hero">
-            <h1 class="title">System Overview</h1>
-            <p class="subtitle">Real-time infrastructure monitoring for the Brawl Stars Global API.</p>
+            <h1 class="title">Infrastructure</h1>
+            <p class="subtitle">Global data pulling and search synchronization engine.</p>
         </div>
 
         <div class="grid">
             <!-- Worker Throughput -->
             <div class="card">
-                <div class="card-label">Worker Throughput</div>
+                <div class="card-label">Throughput / Processed</div>
                 <div id="sync-rate" class="card-value">0.0%</div>
-                <div id="sync-numbers" class="card-subtext">0 / 0 Players</div>
+                <div id="sync-numbers" class="card-subtext">Loading tags...</div>
                 <div class="progress-wrapper">
                     <div class="progress-bg">
                         <div id="sync-progress" class="progress-fill"></div>
@@ -246,17 +238,17 @@
             <div class="card">
                 <div class="card-label">Indexed Matches</div>
                 <div id="total-matches" class="card-value">0</div>
-                <div class="card-subtext">Cumulative database scale</div>
-                <div style="margin-top: 16px; font-size: 12px; color: #555;">
-                    Processing ~47 matches/s
+                <div class="card-subtext">Growth Scale: Normal</div>
+                <div style="margin-top: 16px; font-size: 12px; color: var(--accents-3);">
+                    Pulling ~47 matches/s
                 </div>
             </div>
 
             <!-- Database Size -->
             <div class="card">
-                <div class="card-label">Storage Capacity</div>
-                <div id="db-size" class="card-value">0.00 GB</div>
-                <div id="disk-alert" class="card-subtext">Status: Nominal</div>
+                <div class="card-label">Database Capacity</div>
+                <div id="db-size" class="card-value">0.0 GB</div>
+                <div id="disk-alert" class="card-subtext">Disk Status: Nominal</div>
                 <div class="progress-wrapper">
                     <div class="progress-bg">
                         <div id="db-progress" class="progress-fill"></div>
@@ -264,34 +256,36 @@
                 </div>
             </div>
 
-            <!-- API Shortcuts -->
+            <!-- Documentation -->
             <div class="card" style="grid-column: span 3; display: flex; align-items: center; justify-content: space-between;">
                 <div>
-                    <div class="card-label">Documentation</div>
-                    <div class="card-value" style="font-size: 16px;">API Exploration Interface (Swagger)</div>
+                    <div class="card-label">REST API</div>
+                    <div class="card-value" style="font-size: 18px;">Public Endpoints & Schema</div>
                 </div>
-                <div style="display: flex; gap: 8px;">
-                    <a href="/docs" class="btn btn-white">Open Docs</a>
-                    <a href="/redoc" class="btn btn-black">Redoc</a>
+                <div style="display: flex; gap: 12px;">
+                    <a href="/docs" class="btn btn-white">Swagger UI</a>
+                    <a href="/redoc" class="btn btn-black">Reference</a>
                 </div>
             </div>
         </div>
 
         <footer class="footer">
-            <div>Polled every 5 seconds. SQLite 3.x WAL Mode.</div>
-            <div>BrawlGo Stats &copy; 2026</div>
+            <div>SQLite 3.x Engine. Auto-polling every 5s.</div>
+            <div>&copy; 2026 BrawlGo Labs</div>
         </footer>
     </main>
 
     <script>
         async function updateDashboard() {
             try {
-                const response = await fetch('/health');
+                // Fixed absolute path to prevent subdirectory connection loss
+                const response = await fetch(`${window.location.origin}/health`);
+                if (!response.ok) throw new Error("Health check failed");
                 const data = await response.json();
 
                 // Update Throughput
                 document.getElementById('sync-rate').innerText = data.sync_progress.sync_rate;
-                document.getElementById('sync-numbers').innerText = `${data.sync_progress.processed_players.toLocaleString()} / ${data.sync_progress.total_players.toLocaleString()} Players`;
+                document.getElementById('sync-numbers').innerText = `${data.sync_progress.processed_players.toLocaleString()} of ${data.sync_progress.total_players.toLocaleString()} Profiles`;
                 document.getElementById('sync-progress').style.width = data.sync_progress.sync_rate;
                 
                 // Update Matches
@@ -299,22 +293,23 @@
 
                 // Update Storage
                 document.getElementById('db-size').innerText = data.database.file_size;
-                const dbSizeNum = parseFloat(data.database.file_size);
+                const dbSizeNum = parseFloat(data.database.file_size) || 0;
                 document.getElementById('db-progress').style.width = Math.min((dbSizeNum / 40) * 100, 100) + '%';
                 
                 if (data.system.storage_alert) {
-                    document.getElementById('disk-alert').innerText = "LOW STORAGE SPACE";
+                    document.getElementById('disk-alert').innerText = "CRITICAL: STORAGE LOW";
                     document.getElementById('disk-alert').style.color = "#ee0000";
                 } else {
-                    document.getElementById('disk-alert').innerText = "Status: Nominal";
+                    document.getElementById('disk-alert').innerText = "Disk Status: Nominal";
                     document.getElementById('disk-alert').style.color = "#888";
                 }
 
                 document.getElementById('status-badge').innerHTML = '<div class="status-dot"></div> Engine Live';
+                document.getElementById('status-badge').style.color = "";
 
             } catch (err) {
                 console.error("Dashboard Poll Error:", err);
-                document.getElementById('status-badge').innerHTML = '<div class="status-dot" style="background: #ee0000; box-shadow: none;"></div> Connection Lost';
+                document.getElementById('status-badge').innerHTML = '<div class="status-dot" style="background: #ee0000; box-shadow: none;"></div> DISCONNECTED';
                 document.getElementById('status-badge').style.color = "#ee0000";
             }
         }
