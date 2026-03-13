@@ -1,10 +1,11 @@
 import os
 import time
-import requests
-import sqlite3
 import json
-import zstandard as zstd
+import sqlite3
 import hashlib
+import asyncio
+import aiohttp
+import zstandard as zstd
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,14 +29,13 @@ HEADERS = {
 BASE_URL = "https://api.brawlstars.com/v1"
 DB_NAME = "brawl_data.sqlite"
 
-# --- SQLite Setup (Snowball Mode) ---
+# --- SQLite Setup ---
 def setup_db():
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL;")
     cursor.execute("PRAGMA synchronous=NORMAL;") 
     
-    # Player Discovery & Profile Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS players (
             tag TEXT PRIMARY KEY,
@@ -43,8 +43,6 @@ def setup_db():
             profile_updated_at TIMESTAMP,
             is_processed INTEGER DEFAULT 0,
             has_scanned_club INTEGER DEFAULT 0,
-            
-            -- Deep Profile Data
             name TEXT,
             icon_id INTEGER,
             trophies INTEGER,
@@ -58,18 +56,17 @@ def setup_db():
             victories_duo INTEGER,
             club_tag TEXT,
             club_name TEXT,
-            brawlers_data BLOB -- Comressed with Zstd
+            brawlers_data BLOB
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_trophies ON players(trophies);")
     
-    # Matches Table (Global info)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS matches (
             match_id TEXT PRIMARY KEY,
             battle_time TEXT,
             mode TEXT,
-            type TEXT, -- soloRanked (Ranked Mode) or ranked (Ladder)
+            type TEXT,
             map TEXT,
             map_id INTEGER,
             duration INTEGER,
@@ -78,9 +75,7 @@ def setup_db():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_filter ON matches(mode, type, battle_time);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_time ON matches(battle_time);")
     
-    # Match Players (Granular info for insights)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS match_players (
             match_id TEXT,
@@ -98,47 +93,13 @@ def setup_db():
             PRIMARY KEY (match_id, player_tag)
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_players_tag ON match_players(player_tag);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_players_meta ON match_players(brawler_name, brawler_trophies);")
-
-    # --- High-Performance Fuzzy Search Setup (FTS5) ---
-    # We use 'trigram' tokenizer for insanely fast fuzzy matching
-    cursor.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS players_search USING fts5(
-            tag UNINDEXED, 
-            name,
-            tokenize='trigram'
-        )
-    """)
-
-    # Triggers to keep the search index in sync with the main players table
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS trg_players_search_insert AFTER INSERT ON players
-        BEGIN
-            INSERT INTO players_search(tag, name) VALUES (new.tag, new.name);
-        END;
-    """)
     
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS trg_players_search_update AFTER UPDATE OF name ON players
-        BEGIN
-            UPDATE players_search SET name = new.name WHERE tag = new.tag;
-        END;
-    """)
-    
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS trg_players_search_delete AFTER DELETE ON players
-        BEGIN
-            DELETE FROM players_search WHERE tag = old.tag;
-        END;
-    """)
-
     # Brawler Build Stats Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS brawler_build_stats (
             brawler_id INTEGER,
             item_id INTEGER,
-            item_type TEXT, -- 'gadget', 'starpower', 'gear', 'hypercharge'
+            item_type TEXT,
             item_name TEXT,
             equip_count INTEGER DEFAULT 1,
             PRIMARY KEY (brawler_id, item_id)
@@ -149,266 +110,121 @@ def setup_db():
     return conn
 
 conn = setup_db()
-cursor = conn.cursor()
 
-country_codes = [
-    "global", "af","ax","al","dz","as","ad","ao","ai","aq","ag","ar","am","aw","ac","au","at","az",
-    "bs","bh","bd","bb","by","be","bz","bj","bm","bt","bo","ba","bw","bv","br","io","vg",
-    "bn","bg","bf","bi","kh","cm","ca","ic","cv","bq","ky","cf","ea","td","cl","cn","cx",
-    "cc","co","km","cg","cd","ck","cr","ci","hr","cu","cw","cy","cz","dk","dg","dj","dm",
-    "do","ec","eg","sv","gq","er","ee","et","fk","fo","fj","fi","fr","gf","pf","tf","ga",
-    "gm","ge","de","gh","gi","gr","gl","gd","gp","gu","gt","gg","gn","gw","gy","ht","hm",
-    "hn","hk","hu","is","in","id","ir","iq","ie","im","il","it","jm","jp","je","jo","kz",
-    "ke","ki","xk","kw","kg","la","lv","lb","ls","lr","ly","li","lt","lu","mo","mk","mg",
-    "mw","my","mv","ml","mt","mh","mq","mr","mu","yt","mx","fm","md","mc","mn","me","ms",
-    "ma","mz","mm","na","nr","np","nl","nc","nz","ni","ne","ng","nu","nf","kp","mp","no",
-    "om","pk","pw","ps","pa","pg","py","pe","ph","pn","pl","pt","pr","qa","re","ro","ru",
-    "rw","bl","sh","kn","lc","mf","pm","ws","sm","st","sa","sn","rs","sc","sl","sg","sx",
-    "sk","si","sb","so","za","kr","ss","es","lk","vc","sd","sr","sj","sz","se","ch","sy",
-    "tw","tj","tz","th","tl","tg","tk","to","tt","ta","tn","tr","tm","tc","tv","um","vi",
-    "ug","ua","ae","gb","us","uy","uz","vu","va","ve","vn","wf","eh","ye","zm","zw"
-]
-
-def make_request(url):
-    while True:
-        try:
-            res = requests.get(url, headers=HEADERS)
+# --- Async Helpers ---
+async def fetch_url(session, url):
+    try:
+        async with session.get(url, headers=HEADERS) as res:
             if res.status_code == 200:
-                return res.json()
+                return await res.json()
             elif res.status_code == 429:
-                print("Rate limited... sleeping 5s")
-                time.sleep(5)
-            else:
-                print(f"Error {res.status_code} on {url}")
-                return None
-        except Exception as e:
-            time.sleep(5)
+                await asyncio.sleep(5)
+            return None
+    except Exception:
+        return None
+
+async def fetch_profile(session, tag):
+    url = f"{BASE_URL}/players/%23{tag}"
+    try:
+        async with session.get(url, headers=HEADERS) as res:
+            if res.status == 200:
+                return tag, await res.json()
+            elif res.status == 429:
+                await asyncio.sleep(5)
+            return tag, None
+    except Exception:
+        return tag, None
 
 def push_tags_batch(tags):
-    """Inserts a batch of tags into SQLite. Faster than one-by-one."""
     if not tags: return
     formatted = [(t.replace("#", ""),) for t in tags]
     try:
-        # INSERT OR IGNORE skips existing tags automatically (O(log n) indexing)
+        cursor = conn.cursor()
         cursor.executemany("INSERT OR IGNORE INTO players (tag) VALUES (?)", formatted)
         conn.commit()
-        print(f"Pushed batch of {len(tags)} tags to database.")
     except Exception as e:
         print(f"DB Error: {e}")
 
-def scrape_leaderboards():
-    print(f"--- [PHASE 1] Regional Leaderboard Discovery ---")
-    for code in country_codes:
-        print(f"Scraping region: {code}")
-        url = f"{BASE_URL}/rankings/{code}/players"
-        data = make_request(url)
-        
-        if data and "items" in data:
-            players = data["items"]
-            tags = [p["tag"] for p in players]
-            push_tags_batch(tags)
+async def snowball_and_refresh_loop_async():
+    print("--- [PHASE 2] High-Speed Async Discovery Engine Started ---")
+    
+    connector = aiohttp.TCPConnector(limit=50) 
+    async with aiohttp.ClientSession(connector=connector) as session:
+        while True:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT tag FROM players 
+                WHERE has_scanned_club = 0 
+                   OR profile_updated_at IS NULL
+                   OR profile_updated_at < datetime('now', '-1 day')
+                LIMIT 100
+            """)
+            seeds = cursor.fetchall()
             
-            # Start club seeds for snowball recursively
-            for p in players:
-                if "club" in p and "tag" in p["club"]:
-                    club_tag = p["club"]["tag"].replace("#", "")
-                    scrape_club_members(club_tag)
-        time.sleep(2.0) # Throttled: 2.0s sleep instead of 0.1s
-
-def scrape_club_members(club_tag):
-    """Fetches all 100 members of a club and adds them to DB. Snowball effect!"""
-    url = f"{BASE_URL}/clubs/%23{club_tag}/members"
-    data = make_request(url)
-    if data and "items" in data:
-        members = [m["tag"] for m in data["items"]]
-        push_tags_batch(members)
-
-def snowball_and_refresh_loop():
-    """Continuously finds new players and refreshes stale profiles (>24h old)."""
-    print("--- [PHASE 2] Continuous Discovery & Refresh Engine Started ---")
-    while True:
-        # Get new players OR players who haven't been updated in 24 hours
-        cursor.execute("""
-            SELECT tag FROM players 
-            WHERE has_scanned_club = 0 
-               OR profile_updated_at IS NULL
-               OR profile_updated_at < datetime('now', '-1 day')
-            LIMIT 100
-        """)
-        seeds = cursor.fetchall()
-        
-        if not seeds:
-            print("All profiles are up to date! Sleeping...")
-            time.sleep(60)
-            continue
-            
-        for (tag,) in seeds:
-            # First fetch the player's info to find full profile data and club tag
-            url = f"{BASE_URL}/players/%23{tag}"
-            p_data = make_request(url)
-            
-            if p_data:
-                club_tag = ""
-                club_name = ""
-                if "club" in p_data and "tag" in p_data["club"]:
-                    club_tag = p_data["club"]["tag"].replace("#", "")
-                    club_name = p_data["club"].get("name", "")
-                    scrape_club_members(club_tag)
+            if not seeds:
+                print("All profiles up to date! Sleeping 60s...")
+                await asyncio.sleep(60)
+                continue
                 
-                # Update player profile data
-                brawlers_json = json.dumps(p_data.get("brawlers", []))
-                compressed_brawlers = compress_data(brawlers_json)
+            tasks = [fetch_profile(session, tag[0]) for tag in seeds]
+            results = await asyncio.gather(*tasks)
+            
+            for tag, p_data in results:
+                if p_data:
+                    process_profile_data(tag, p_data)
+            
+            print(f"Processed batch of {len(seeds)} profiles.")
 
+def process_profile_data(tag, p_data):
+    cursor = conn.cursor()
+    club_tag = ""
+    club_name = ""
+    if "club" in p_data and "tag" in p_data["club"]:
+        club_tag = p_data["club"]["tag"].replace("#", "")
+        club_name = p_data["club"].get("name", "")
+    
+    # Update profile
+    brawlers_json = json.dumps(p_data.get("brawlers", []))
+    compressed_brawlers = compress_data(brawlers_json)
+
+    cursor.execute("""
+        UPDATE players 
+        SET has_scanned_club = 1,
+            profile_updated_at = CURRENT_TIMESTAMP,
+            name = ?, icon_id = ?, trophies = ?, highest_trophies = ?, total_prestige_level = ?,
+            exp_level = ?, exp_points = ?, is_qualified_from_championship_challenge = ?,
+            victories_3v3 = ?, victories_solo = ?, victories_duo = ?,
+            club_tag = ?, club_name = ?, brawlers_data = ?
+        WHERE tag = ?
+    """, (
+        p_data.get("name", ""), p_data.get("icon", {}).get("id", None),
+        p_data.get("trophies", 0), p_data.get("highestTrophies", 0),
+        p_data.get("totalPrestigeLevel", 0), p_data.get("expLevel", 0),
+        p_data.get("expPoints", 0), 1 if p_data.get("isQualifiedFromChampionshipChallenge") else 0,
+        p_data.get("3vs3Victories", 0), p_data.get("soloVictories", 0), p_data.get("duoVictories", 0),
+        club_tag, club_name, compressed_brawlers, tag
+    ))
+
+    # Update build stats
+    for brawler in p_data.get("brawlers", []):
+        b_id = brawler["id"]
+        for key, item_type in [("gadgets", "gadget"), ("starPowers", "starpower"), ("gears", "gear"), ("hyperCharges", "hypercharge")]:
+            for item in brawler.get(key, []):
                 cursor.execute("""
-                    UPDATE players 
-                    SET has_scanned_club = 1,
-                        profile_updated_at = CURRENT_TIMESTAMP,
-                        name = ?, icon_id = ?, trophies = ?, highest_trophies = ?, total_prestige_level = ?,
-                        exp_level = ?, exp_points = ?, is_qualified_from_championship_challenge = ?,
-                        victories_3v3 = ?, victories_solo = ?, victories_duo = ?,
-                        club_tag = ?, club_name = ?, brawlers_data = ?
-                    WHERE tag = ?
-                """, (
-                    p_data.get("name", ""),
-                    p_data.get("icon", {}).get("id", 0),
-                    p_data.get("trophies", 0),
-                    p_data.get("highestTrophies", 0),
-                    p_data.get("totalPrestigeLevel", 0),
-                    p_data.get("expLevel", 0),
-                    p_data.get("expPoints", 0),
-                    1 if p_data.get("isQualifiedFromChampionshipChallenge") else 0,
-                    p_data.get("3vs3Victories", 0),
-                    p_data.get("soloVictories", 0),
-                    p_data.get("duoVictories", 0),
-                    club_tag, club_name,
-                    compressed_brawlers,
-                    tag
-                ))
+                    INSERT INTO brawler_build_stats (brawler_id, item_id, item_type, item_name)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(brawler_id, item_id) DO UPDATE SET equip_count = equip_count + 1
+                """, (b_id, item["id"], item_type, item["name"]))
+    
+    conn.commit()
 
-                # Update Brawler Build Stats
-                for brawler in p_data.get("brawlers", []):
-                    b_id = brawler["id"]
-                    
-                    # Track Gadgets, Star Powers, Gears, Hypercharges
-                    build_items = [
-                        ("gadgets", "gadget"),
-                        ("starPowers", "starpower"),
-                        ("gears", "gear"),
-                        ("hyperCharges", "hypercharge")
-                    ]
-                    
-                    for key, item_type in build_items:
-                        for item in brawler.get(key, []):
-                            cursor.execute("""
-                                INSERT INTO brawler_build_stats (brawler_id, item_id, item_type, item_name)
-                                VALUES (?, ?, ?, ?)
-                                ON CONFLICT(brawler_id, item_id) DO UPDATE SET equip_count = equip_count + 1
-                            """, (b_id, item["id"], item_type, item["name"]))
-                
-                # --- Battlelog Ingestion ---
-                log_url = f"{BASE_URL}/players/%23{tag}/battlelog"
-                log_data = make_request(log_url)
-                if log_data and "items" in log_data:
-                    today = time.strftime("%Y%m%d", time.gmtime())
-                    for item in log_data["items"]:
-                        # 1. Selective Storage: Only save matches from today
-                        if not item["battleTime"].startswith(today):
-                            continue
-                        
-                        battle = item["battle"]
-                        event = item["event"]
-                        
-                        mode = event.get("mode") or battle.get("mode", "")
-                        
-                        # Determine winner
-                        winner_team = -1
-                        result = battle.get("result", "")
-                        if result == "victory":
-                            winner_team = 0
-                        elif result == "defeat":
-                            winner_team = 1
-                            
-                        match_players = []
-                        all_tags = []
-                        
-                        for i, team in enumerate(battle.get("teams", [])):
-                            for p in team:
-                                p["team_id"] = i
-                                p["is_winner"] = 1 if i == winner_team else 0
-                                p["result"] = result if i == winner_team else ("defeat" if result == "victory" else "victory" if result == "defeat" else result)
-                                all_tags.append(p["tag"])
-                            match_players.extend(team)
-                            
-                        for p in battle.get("players", []):
-                            p["team_id"] = 0
-                            is_winner = 1 if result == "victory" or battle.get("rank", 10) <= 4 else 0
-                            p["is_winner"] = is_winner
-                            p["result"] = "victory" if is_winner else "defeat"
-                            all_tags.append(p["tag"])
-                        match_players.extend(battle.get("players", []))
-                        
-                        # Unique Match ID
-                        all_tags.sort()
-                        all_tags_str = ",".join(all_tags)
-                        match_seed = f"{all_tags_str}|{event.get('id', 0)}|{battle.get('duration', 0)}|{event.get('map', '')}"
-                        match_id = f"{item['battleTime']}-{hashlib.sha1(match_seed.encode()).hexdigest()}"
-                        
-                        # Discovered Tags
-                        discovered_tags = [p["tag"] for p in match_players if len(p["tag"]) >= 2]
-                        if discovered_tags:
-                            push_tags_batch(discovered_tags)
-                            
-                        # Store Match
-                        star_player_tag = (battle.get("starPlayer", {}) or {}).get("tag", "").replace("#", "").upper()
-                        cursor.execute("""
-                            INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            match_id, item["battleTime"], mode, battle.get("type", ""), 
-                            event.get("map", ""), event.get("id", 0), battle.get("duration", 0),
-                            star_player_tag, event.get("id", 0)
-                        ))
-                        
-                        # Store Match Players
-                        for p in match_players:
-                            if len(p["tag"]) < 2: continue
-                            clean_t = p["tag"].replace("#", "").upper()
-                            b = p["brawler"]
-                            s = b.get("skin", {}) or {}
-                            
-                            cursor.execute("""
-                                INSERT OR IGNORE INTO match_players (
-                                    match_id, player_tag, brawler_name, brawler_id, brawler_power, 
-                                    brawler_trophies, skin_name, skin_id, is_winner, team_id, trophy_change, result
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                match_id, clean_t, b["name"], b["id"], b["power"],
-                                b["trophies"], s.get("name", ""), s.get("id", 0),
-                                p["is_winner"], p["team_id"], p.get("trophyChange", 0), p["result"]
-                            ))
-                            
-                            # Upsert Player
-                            cursor.execute("""
-                                INSERT INTO players (tag, name, icon_id)
-                                VALUES (?, ?, ?)
-                                ON CONFLICT(tag) DO UPDATE SET
-                                    name = excluded.name,
-                                    icon_id = excluded.icon_id
-                                WHERE name IS NULL OR icon_id IS NULL OR name = ''
-                            """, (clean_t, p.get("name", ""), p.get("icon", {}).get("id", 0)))
-            else:
-                # Mark as scanned even if API failed/returned null to prevent infinite loops
-                cursor.execute("UPDATE players SET has_scanned_club = 1 WHERE tag = ?", (tag,))
-                
-        conn.commit()
-
-if __name__ == "__main__":
+async def main():
     if not SUPERCELL_API_TOKEN:
         print("ERROR: SUPERCELL_API_TOKEN is missing in .env")
-        exit(1)
+        return
         
-    # Start with leaderboards to seed the DB
-    scrape_leaderboards()
-    
-    # Run the continuous engine indefinitely
-    snowball_and_refresh_loop()
+    # We can still use the async loop for general discovery
+    await snowball_and_refresh_loop_async()
+
+if __name__ == "__main__":
+    asyncio.run(main())

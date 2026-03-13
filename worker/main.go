@@ -30,7 +30,7 @@ const (
 type Payload struct {
 	Match  []interface{} // Match data args: match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id
 	Player []interface{} // Match_Player data args: match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, skin_id, is_winner, team_id, trophy_change, result
-	Upsert []interface{} // Player upsert args
+	Upsert []interface{} // Player upsert args: tag, name
 	NewTag string
 }
 
@@ -137,9 +137,6 @@ func fetchUnprocessedTags(db *sql.DB, limit int) []string {
 type PlayerInfo struct {
 	Tag  string `json:"tag"`
 	Name string `json:"name"`
-	Icon struct {
-		ID int `json:"id"`
-	} `json:"icon"`
 	Brawler struct {
 		ID       int    `json:"id"`
 		Name     string `json:"name"`
@@ -300,7 +297,7 @@ func processSnowball(data BattleLogResponse, out chan<- Payload) {
 				cleanTag = strings.ToUpper(cleanTag)
 
 				out <- Payload{Player: []any{matchID, cleanTag, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.Brawler.Skin.ID, p.IsWinner, p.TeamID, p.TrophyChange, p.Result}}
-				out <- Payload{Upsert: []any{cleanTag, p.Name, p.Icon.ID}}
+				out <- Payload{Upsert: []any{cleanTag, p.Name}}
 			}
 		}
 	}
@@ -352,12 +349,11 @@ func flushBatch(db *sql.DB, batch []Payload) {
 	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, skin_id, is_winner, team_id, trophy_change, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	stmtUpsert, _ := tx.Prepare(`
-		INSERT INTO players (tag, name, icon_id) 
-		VALUES (?, ?, ?) 
+		INSERT INTO players (tag, name) 
+		VALUES (?, ?) 
 		ON CONFLICT(tag) DO UPDATE SET 
-			name = excluded.name, 
-			icon_id = excluded.icon_id 
-		WHERE name IS NULL OR icon_id IS NULL OR name = ''
+			name = excluded.name 
+		WHERE name IS NULL OR name = ''
 	`)
 	stmtNewTag, _ := tx.Prepare("INSERT OR IGNORE INTO players (tag) VALUES (?)")
 
