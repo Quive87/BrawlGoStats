@@ -119,9 +119,30 @@ def get_player_profile(tag: str = Path(..., examples=["#P8CY9JGQR"], description
     if not player:
         raise HTTPException(status_code=404, detail="Player not found in our database")
     
-    player_dict = dict(player)
-    player_dict["brawlers"] = decompress_brawlers(player_dict.pop("brawlers_data"))
-    return player_dict
+    row = dict(player)
+    
+    # Map to Official Brawl Stars API Schema
+    profile = {
+        "tag": "#" + row["tag"],
+        "name": row["name"],
+        "trophies": row["trophies"],
+        "highestTrophies": row["highest_trophies"],
+        "expLevel": row["exp_level"],
+        "expPoints": row["exp_points"],
+        "totalPrestigeLevel": row["total_prestige_level"],
+        "soloVictories": row["victories_solo"],
+        "duoVictories": row["victories_duo"],
+        "3vs3Victories": row["victories_3v3"],
+        "isQualifiedFromChampionshipChallenge": bool(row["is_qualified_from_championship_challenge"]),
+        "icon": {"id": row["icon_id"]},
+        "club": {
+            "tag": "#" + row["club_tag"] if row["club_tag"] else None,
+            "name": row["club_name"]
+        } if row["club_tag"] else {},
+        "brawlers": decompress_brawlers(row["brawlers_data"])
+    }
+    
+    return profile
 
 @app.get("/battlelog/{tag}", summary="Get Processed Battle Log")
 def get_player_battlelog(
