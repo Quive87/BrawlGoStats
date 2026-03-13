@@ -184,7 +184,8 @@ def get_player_battlelog(
         
         player_obj = {
             "tag": "#" + row["player_tag"],
-            "name": None, # Name not stored in match_players to save space
+            "name": row["player_name"],
+            "icon": {"id": row["icon_id"]} if row["icon_id"] else None,
             "brawler": {
                 "id": row["brawler_id"],
                 "name": row["brawler_name"],

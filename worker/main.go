@@ -122,6 +122,9 @@ func fetchUnprocessedTags(db *sql.DB, limit int) []string {
 type PlayerInfo struct {
 	Tag     string `json:"tag"`
 	Name    string `json:"name"`
+	Icon    struct {
+		ID int `json:"id"`
+	} `json:"icon"`
 	Brawler struct {
 		ID       int    `json:"id"`
 		Name     string `json:"name"`
@@ -206,7 +209,7 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 	defer tx.Rollback()
 
 	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, is_winner, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, player_name, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, is_winner, team_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 
 	for _, item := range data.Items {
 		isToday := strings.HasPrefix(item.BattleTime, today)
@@ -279,7 +282,7 @@ func processSnowball(data BattleLogResponse, db *sql.DB) {
 				cleanTag := strings.TrimPrefix(p.Tag, "#")
 				cleanTag = strings.ToUpper(cleanTag)
 				
-				_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
+				_, _ = stmtPlayer.Exec(matchID, cleanTag, p.Name, p.Icon.ID, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies, p.Brawler.Skin.Name, p.IsWinner, p.TeamID)
 			}
 		}
 	}

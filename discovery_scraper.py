@@ -83,6 +83,8 @@ def setup_db():
         CREATE TABLE IF NOT EXISTS match_players (
             match_id TEXT,
             player_tag TEXT,
+            player_name TEXT,
+            icon_id INTEGER,
             brawler_name TEXT,
             brawler_id INTEGER,
             brawler_power INTEGER,
