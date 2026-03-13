@@ -481,7 +481,7 @@ def get_mode_popularity():
 def get_icon_popularity():
     """Returns the most popular profile icons currently equipped by active players."""
     conn = get_db()
-    query = "SELECT icon_id, COUNT(*) as count FROM players WHERE icon_id IS NOT NULL GROUP BY icon_id ORDER BY count DESC LIMIT 200"
+    query = "SELECT icon_id, COUNT(*) as count FROM players WHERE icon_id IS NOT NULL AND icon_id != 0 GROUP BY icon_id ORDER BY count DESC LIMIT 200"
     results = conn.execute(query).fetchall()
     conn.close()
     return [dict(r) for r in results]
