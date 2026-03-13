@@ -125,33 +125,90 @@ def get_player_profile(tag: str = Path(..., examples=["#P8CY9JGQR"], description
 
 @app.get("/battlelog/{tag}", summary="Get Processed Battle Log")
 def get_player_battlelog(
-    tag: str = Path(..., examples=["#P8CY9JGQR"]), 
+    tag: str = Path(..., examples=["P8CY9JGQR"]), 
     limit: int = Query(25, ge=1, le=100)
 ):
-    """Returns the recent match history for a specific player."""
+    """
+    Returns the recent match history in the official Brawl Stars API format.
+    Reconstructs nested 'teams' or 'players' structure from the lookup.
+    """
     tag = tag.replace("#", "").upper()
     conn = get_db()
     
-    # Get the latest matches for this player
-    # We join with match_players to find matches where the specific tag was present
-    query = """
-        SELECT m.*, mp.brawler_name, mp.brawler_power, mp.brawler_trophies, mp.skin_name
+    # 1. Get the match IDs for this player
+    match_ids_rows = conn.execute("""
+        SELECT match_id FROM match_players 
+        WHERE player_tag = ? 
+        ORDER BY rowid DESC 
+        LIMIT ?
+    """, (tag, limit)).fetchall()
+    
+    if not match_ids_rows:
+        conn.close()
+        return {"items": []}
+        
+    match_ids = [row["match_id"] for row in match_ids_rows]
+    
+    # 2. Fetch all participants and match metadata for these matches
+    placeholders = ",".join(["?"] * len(match_ids))
+    query = f"""
+        SELECT m.*, mp.*
         FROM matches m
         JOIN match_players mp ON m.match_id = mp.match_id
-        WHERE mp.player_tag = ?
-        ORDER BY m.battle_time DESC 
-        LIMIT ?
+        WHERE m.match_id IN ({placeholders})
+        ORDER BY m.battle_time DESC
     """
-    matches = conn.execute(query, (tag, limit)).fetchall()
-    
-    # For a truly complete battlelog, we might want to fetch all 6-10 players in each match
-    # But for extreme speed on a 40GB VPS, we'll return the player's specific performance in those games.
-    
+    all_data = conn.execute(query, match_ids).fetchall()
     conn.close()
-    if not matches:
-        return {"tag": tag, "matches": [], "message": "No matches found for this tag yet."}
+
+    # 3. Group data by match_id
+    matches_map = {}
+    for row in all_data:
+        mid = row["match_id"]
+        if mid not in matches_map:
+            matches_map[mid] = {
+                "battleTime": row["battle_time"],
+                "event": {
+                    "mode": row["mode"],
+                    "map": row["map"]
+                },
+                "battle": {
+                    "mode": row["mode"],
+                    "type": row["type"],
+                    "duration": row["duration"],
+                    "starPlayer": {"tag": "#" + row["star_player_tag"]} if row["star_player_tag"] else None,
+                    "teams": [],
+                    "players": []
+                }
+            }
         
-    return {"tag": tag, "matches": [dict(m) for m in matches]}
+        player_obj = {
+            "tag": "#" + row["player_tag"],
+            "name": None, # Name not stored in match_players to save space
+            "brawler": {
+                "name": row["brawler_name"],
+                "power": row["brawler_power"],
+                "trophies": row["brawler_trophies"]
+            }
+        }
+        
+        mode = row["mode"].lower()
+        if "showdown" in mode:
+            # Showdown uses flat 'players' array
+            matches_map[mid]["battle"]["players"].append(player_obj)
+        else:
+            # 3v3 / Duels use 'teams' array of arrays
+            team_id = row["team_id"]
+            # Ensure outer list has enough slots
+            while len(matches_map[mid]["battle"]["teams"]) <= team_id:
+                matches_map[mid]["battle"]["teams"].append([])
+            matches_map[mid]["battle"]["teams"][team_id].append(player_obj)
+
+    # Convert map to sorted list
+    items = list(matches_map.values())
+    items.sort(key=lambda x: x["battleTime"], reverse=True)
+
+    return {"items": items}
 
 @app.get("/search", summary="Search Players by Name")
 def search_player_by_name(name: str = Query(..., examples=["Pika"])):
