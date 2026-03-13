@@ -1,2 +1,7 @@
 requests
 python-dotenv
+fastapi
+uvicorn
+gunicorn
+zstandard
+cachetools
