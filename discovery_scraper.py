@@ -255,9 +255,9 @@ async def reporter_loop():
         curr_req = metrics["req_total"]
         rate = (curr_req - last_req) / 5
         last_req = curr_req
-        print(f"[PY NET {rate:4.1f} req/s] Total: {curr_req:<7} | 429: {metrics['429_hits']:<4} | Errors: {metrics['errors']:<4} | Queue: {db_queue.qsize()}")
+        print(f"[PY NET {rate:4.1f} req/s] Total: {curr_req:<7} | 429: {metrics['429_hits']:<4} | Errors: {metrics['errors']:<4} | Q: {task_queue.qsize()} DB: {db_queue.qsize()}")
 
-# --- Database Writer (High-Speed Batcher) ---
+# --- Database Writer ---
 db_queue = asyncio.Queue(maxsize=10000)
 
 async def db_writer():
@@ -266,11 +266,8 @@ async def db_writer():
     while True:
         ops = []
         try:
-            # wait for first item
             op = await db_queue.get()
             ops.append(op)
-            
-            # fill batch
             while len(ops) < batch_size:
                 try:
                     op = db_queue.get_nowait()
@@ -344,59 +341,75 @@ async def db_writer():
             await asyncio.sleep(1)
 
 # --- High-Speed Parallel Workers ---
-async def fetch_both(session, tag, semaphore):
-    async with semaphore:
-        # Profile Enrichment
-        p_res = await fetch_profile(session, tag)
-        await update_metrics("req")
-        if p_res[2] == 200:
-            await queue_profile_data(tag, p_res[1])
-        elif p_res[2] == 429:
-            await update_metrics("429")
-            await asyncio.sleep(10) # Heavy local backoff
-        elif p_res[2] == 404:
-            await db_queue.put(("status_404", tag))
+task_queue = asyncio.Queue(maxsize=5000)
 
-        # Battlelog Discovery
-        b_res = await fetch_battlelog(session, tag)
-        await update_metrics("req")
-        if b_res:
-            await queue_battlelog_data(tag, b_res)
-            await db_queue.put(("scan_done", tag))
+async def worker_task(session):
+    while True:
+        tag = await task_queue.get()
+        try:
+            # Profile Enrichment (Priority 1)
+            p_res = await fetch_profile(session, tag)
+            await update_metrics("req")
+            if p_res[2] == 200:
+                await queue_profile_data(tag, p_res[1])
+            elif p_res[2] == 429:
+                await update_metrics("429")
+                await asyncio.sleep(10) # Individual worker backoff
+                await task_queue.put(tag) # Re-queue for later
+                continue
+            elif p_res[2] == 404:
+                await db_queue.put(("status_404", tag))
+
+            # Battlelog Discovery (Parallel with Profile)
+            b_res = await fetch_battlelog(session, tag)
+            await update_metrics("req")
+            if b_res:
+                await queue_battlelog_data(tag, b_res)
+                await db_queue.put(("scan_done", tag))
+        except Exception as e:
+            await update_metrics("error")
+        finally:
+            task_queue.task_done()
 
 async def main_loop_antigravity():
-    print("--- [ANTIGRAVITY] Insanely Fast Pipeline Started ---")
+    print("--- [ANTIGRAVITY] Continuous Worker Pool Started ---")
     
-    semaphore = asyncio.Semaphore(150) # 150 concurrent requests
-    connector = aiohttp.TCPConnector(limit=150, ttl_dns_cache=300)
+    num_workers = 150 # 150 parallel workers per user request
+    connector = aiohttp.TCPConnector(limit=num_workers, ttl_dns_cache=300)
     
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Initial seeding logic
+        # Initial seeding
         await seed_if_empty(session)
         
+        # Start workers
+        for _ in range(num_workers):
+            asyncio.create_task(worker_task(session))
+        
+        # Continuous Feeder
         while True:
-            cursor = conn.cursor()
-            # Find players needing enrichment OR discovery refresh
-            cursor.execute("""
-                SELECT tag FROM players
-                WHERE profile_updated_at IS NULL OR last_battlelog_scan IS NULL
-                OR profile_updated_at < datetime('now', '-3 days')
-                LIMIT 2000
-            """)
-            seeds = cursor.fetchall()
+            if task_queue.qsize() < 1000:
+                cursor = conn.cursor()
+                # Prioritize enrichment where discovery is already done (optimize quota)
+                cursor.execute("""
+                    SELECT tag FROM players
+                    WHERE profile_updated_at IS NULL
+                    OR last_battlelog_scan IS NULL
+                    OR profile_updated_at < datetime('now', '-3 days')
+                    LIMIT 2000
+                """)
+                seeds = cursor.fetchall()
 
-            if not seeds:
-                print("All caught up! Idling 30s...")
-                await asyncio.sleep(30)
-                continue
+                if not seeds:
+                    print("All caught up! Idling 30s...")
+                    await asyncio.sleep(30)
+                    continue
 
-            tasks = []
-            for (tag,) in seeds:
-                tasks.append(fetch_both(session, tag, semaphore))
+                for (tag,) in seeds:
+                    await task_queue.put(tag)
+                
+                print(f"Fed {len(seeds)} tags to queue. Q-Size: {task_queue.qsize()}")
             
-            # Process entire batch in parallel without a single gather blocking
-            await asyncio.gather(*tasks)
-            print(f"Finished parallel sweep of {len(seeds)} players.")
+            await asyncio.sleep(5) # Throttled feeder to match worker consumption
 
 async def main():
     if not SUPERCELL_API_TOKEN:
