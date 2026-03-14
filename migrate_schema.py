@@ -124,6 +124,12 @@ def migrate():
     except Exception as e:
         print(f"Error creating brawler_build_stats table: {e}")
 
+    try:
+        print("Checking players index...")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_enrichment ON players(profile_updated_at);")
+    except Exception as e:
+        print(f"Error creating index idx_players_enrichment: {e}")
+        
     conn.commit()
     conn.close()
     print("Migration completed successfully!")

@@ -60,6 +60,7 @@ def setup_db():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_trophies ON players(trophies);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_enrichment ON players(profile_updated_at);")
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS matches (

@@ -65,7 +65,11 @@ def decompress_brawlers(compressed_data):
     except:
         return []
 
+# 1-Minute Cache for health check to prevent DB lag on 2M+ rows
+cache_1m = TTLCache(maxsize=10, ttl=60)
+
 @app.get("/health", summary="System Health & Storage Monitor")
+@cached(cache_1m)
 def health_check():
     """System health monitoring: checks DB size, worker progress, and disk availability."""
     conn = get_db()
