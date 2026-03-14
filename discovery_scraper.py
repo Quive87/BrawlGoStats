@@ -60,8 +60,6 @@ def setup_db():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_trophies ON players(trophies);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_enrichment ON players(profile_updated_at);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_battlelog_scan ON players(last_battlelog_scan);")
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS matches (
@@ -108,6 +106,9 @@ def setup_db():
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_enrichment ON players(profile_updated_at);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_battlelog_scan ON players(last_battlelog_scan);")
 
     # Profile-based brawler/skin stats (used by /meta/skins when populated)
     cursor.execute("""
