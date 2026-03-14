@@ -94,7 +94,19 @@ def setup_db():
             PRIMARY KEY (match_id, player_tag, brawler_id)
         )
     """)
-    
+    # Ensure columns exist for existing DBs (ignore duplicate column)
+    for alter_sql in (
+        "ALTER TABLE match_players ADD COLUMN trophy_change INTEGER",
+        "ALTER TABLE match_players ADD COLUMN result TEXT",
+        "ALTER TABLE match_players ADD COLUMN skin_id INTEGER",
+        "ALTER TABLE matches ADD COLUMN event_id INTEGER",
+    ):
+        try:
+            cursor.execute(alter_sql)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+
     # Brawler Build Stats Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS brawler_build_stats (
@@ -222,11 +234,11 @@ async def db_writer():
                     tag = data
                     cursor.execute("UPDATE players SET has_scanned_club = 1, is_processed = 1, profile_updated_at = CURRENT_TIMESTAMP WHERE tag = ?", (tag,))
                 elif type == "match":
-                    match_id, battle_time, mode, m_type, map, map_id, duration, star_tag = data
+                    match_id, battle_time, mode, m_type, map, map_id, duration, star_tag, event_id = data
                     cursor.execute("""
                         INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (match_id, battle_time, mode, m_type, map, map_id, duration, star_tag, map_id))
+                    """, (match_id, battle_time, mode, m_type, map, map_id, duration, star_tag, event_id))
                 elif type == "match_player":
                     m_id, p_tag, b_name, b_id, b_power, b_trophies, s_name, s_id, is_winner, team_id, t_change, result = data
                     cursor.execute("INSERT OR IGNORE INTO players (tag) VALUES (?)", (p_tag,))
@@ -255,24 +267,34 @@ async def snowball_and_refresh_loop_async():
         while True:
             cursor = conn.cursor()
             cursor.execute("""
-                OR profile_updated_at < datetime('now', '-7 days')
+                SELECT tag FROM players
+                WHERE is_processed = 0 OR profile_updated_at < datetime('now', '-7 days')
                 LIMIT 500
             """)
             seeds = cursor.fetchall()
-            
+
             if not seeds:
                 print("All profiles up to date! Sleeping 60s...")
                 await asyncio.sleep(60)
                 continue
-            tasks = [fetch_profile(session, tag_tuple[0]) for tag_tuple in seeds]
-            results = await asyncio.gather(*tasks)
-            
-            for tag, p_data, status in results:
+
+            # Fetch profiles and battlelogs for this batch (500 players per cycle)
+            profile_tasks = [fetch_profile(session, tag_tuple[0]) for tag_tuple in seeds]
+            battlelog_tasks = [fetch_battlelog(session, tag_tuple[0]) for tag_tuple in seeds]
+            profile_results = await asyncio.gather(*profile_tasks)
+            battlelog_results = await asyncio.gather(*battlelog_tasks)
+
+            for tag, p_data, status in profile_results:
                 if p_data:
                     await queue_profile_data(tag, p_data)
                 elif status == 404:
                     await db_queue.put(("status_404", tag))
-            
+
+            for (tag_tuple, log_data) in zip(seeds, battlelog_results):
+                tag = tag_tuple[0]
+                if log_data:
+                    await queue_battlelog_data(tag, log_data)
+
             print(f"Dispatched batch of {len(seeds)} profiles and battlelogs. Queue size: {db_queue.qsize()}")
 
 async def queue_profile_data(tag, p_data):
@@ -319,6 +341,7 @@ async def queue_battlelog_data(tag, log_data):
         players_to_process = []
         all_tags = []
 
+        battle_trophy_change = item["battle"].get("trophyChange", 0)
         for i, team in enumerate(item["battle"].get("teams", [])):
             for p in team:
                 p_tag = p["tag"].replace("#", "").upper()
@@ -327,7 +350,7 @@ async def queue_battlelog_data(tag, log_data):
                 players_to_process.append({
                     "tag": p_tag, "name": p.get("name"), "team_id": i, "is_winner": is_winner,
                     "result": "victory" if is_winner else "defeat", "brawlers": p.get("brawlers", [p.get("brawler")]),
-                    "trophy_change": p.get("trophyChange", 0)
+                    "trophy_change": p.get("trophyChange") if p.get("trophyChange") is not None else battle_trophy_change
                 })
 
         for p in item["battle"].get("players", []):
@@ -337,15 +360,16 @@ async def queue_battlelog_data(tag, log_data):
             players_to_process.append({
                 "tag": p_tag, "name": p.get("name"), "team_id": 0, "is_winner": is_winner,
                 "result": "victory" if is_winner else "defeat", "brawlers": p.get("brawlers", [p.get("brawler")]),
-                "trophy_change": p.get("trophyChange", 0)
+                "trophy_change": p.get("trophyChange") if p.get("trophyChange") is not None else battle_trophy_change
             })
 
         if not all_tags: continue
         all_tags.sort()
-        tags_hash = hashlib.sha1(f"{','.join(all_tags)}|{map_id}|{duration}|{map_name}".encode()).hexdigest()
-        match_id = f"{match_id_base}-{tags_hash[:8]}"
+        event_id = map_id  # event.id for match_id hash and matches.event_id
+        tags_hash = hashlib.sha256(f"{match_id_base}|{event_id}|{','.join(all_tags)}|{map_name}".encode()).hexdigest()
+        match_id = f"{match_id_base}-{tags_hash[:16]}"
 
-        await db_queue.put(("match", (match_id, match_id_base, mode, item["battle"].get("type"), map_name, map_id, duration, star_tag)))
+        await db_queue.put(("match", (match_id, match_id_base, mode, item["battle"].get("type"), map_name, map_id, duration, star_tag, event_id)))
 
         for p in players_to_process:
             for b in p["brawlers"]:

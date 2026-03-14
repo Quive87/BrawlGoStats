@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/sha1"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -170,12 +170,13 @@ type BattleEntry struct {
 		Map  string `json:"map"`
 	} `json:"event"`
 	Battle struct {
-		Mode       string `json:"mode"`
-		Type       string `json:"type"`
-		Result     string `json:"result"`
-		Duration   int    `json:"duration"`
-		Rank       int    `json:"rank"`
-		StarPlayer struct {
+		Mode         string `json:"mode"`
+		Type         string `json:"type"`
+		Result       string `json:"result"`
+		Duration     int    `json:"duration"`
+		Rank         int    `json:"rank"`
+		TrophyChange int    `json:"trophyChange"`
+		StarPlayer   struct {
 			Tag string `json:"tag"`
 		} `json:"starPlayer"`
 		Teams   [][]PlayerInfo `json:"teams"`
@@ -249,6 +250,8 @@ func processSnowball(data BattleLogResponse, out chan<- Payload) {
 		for i, team := range item.Battle.Teams {
 			for _, p := range team {
 				p.TeamID = i
+				// Team games: API gives trophyChange at battle level, use it for each player
+				p.TrophyChange = item.Battle.TrophyChange
 				// Win Condition: 3v3 Result or Duo Rank 1-2
 				if i == winnerTeam || (item.Battle.Mode == "duoShowdown" && item.Battle.Rank <= 2) {
 					p.IsWinner = 1
@@ -284,7 +287,8 @@ func processSnowball(data BattleLogResponse, out chan<- Payload) {
 		}
 		sort.Strings(allTags)
 		allTagsStr := strings.Join(allTags, ",")
-		matchID := fmt.Sprintf("%s-%x", item.BattleTime, sha1.Sum([]byte(fmt.Sprintf("%s|%d|%d|%s", allTagsStr, item.Event.ID, item.Battle.Duration, item.Event.Map))))
+		hashInput := fmt.Sprintf("%s|%d|%s|%s", item.BattleTime, item.Event.ID, allTagsStr, item.Event.Map)
+		matchID := fmt.Sprintf("%s-%x", item.BattleTime, sha256.Sum256([]byte(hashInput)))
 
 		// 3. Snowball and Output
 		for _, p := range playersToProcess {
