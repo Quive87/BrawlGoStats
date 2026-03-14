@@ -45,7 +45,8 @@ def migrate():
             ("exp_level", "INTEGER"),
             ("exp_points", "INTEGER"),
             ("club_tag", "TEXT"),
-            ("club_name", "TEXT")
+            ("club_name", "TEXT"),
+            ("last_battlelog_scan", "TIMESTAMP")
         ]
         for col, col_type in cols_to_add:
             try:
@@ -127,6 +128,7 @@ def migrate():
     try:
         print("Checking players index...")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_enrichment ON players(profile_updated_at);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_battlelog_scan ON players(last_battlelog_scan);")
     except Exception as e:
         print(f"Error creating index idx_players_enrichment: {e}")
         

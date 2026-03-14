@@ -61,6 +61,7 @@ def setup_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_trophies ON players(trophies);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_enrichment ON players(profile_updated_at);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_battlelog_scan ON players(last_battlelog_scan);")
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS matches (
@@ -100,6 +101,7 @@ def setup_db():
         "ALTER TABLE match_players ADD COLUMN result TEXT",
         "ALTER TABLE match_players ADD COLUMN skin_id INTEGER",
         "ALTER TABLE matches ADD COLUMN event_id INTEGER",
+        "ALTER TABLE players ADD COLUMN last_battlelog_scan TIMESTAMP",
     ):
         try:
             cursor.execute(alter_sql)
@@ -133,6 +135,55 @@ def setup_db():
 
     conn.commit()
     return conn
+
+async def seed_if_empty(session):
+    """Seed the database from global leaderboard if it's empty."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM players")
+    count = cursor.fetchone()[0]
+    
+    if count == 0:
+        print("Database is empty. Fetching seeds from ALL countries in parallel...")
+        country_codes = [
+            "global", "af","ax","al","dz","as","ad","ao","ai","aq","ag","ar","am","aw","ac","au","at","az",
+            "bs","bh","bd","bb","by","be","bz","bj","bm","bt","bo","ba","bw","bv","br","io","vg",
+            "bn","bg","bf","bi","kh","cm","ca","ic","cv","bq","ky","cf","ea","td","cl","cn","cx",
+            "cc","co","km","cg","cd","ck","cr","ci","hr","cu","cw","cy","cz","dk","dg","dj","dm",
+            "do","ec","eg","sv","gq","er","ee","et","fk","fo","fj","fi","fr","gf","pf","tf","ga",
+            "gm","ge","de","gh","gi","gr","gl","gd","gp","gu","gt","gg","gn","gw","gy","ht","hm",
+            "hn","hk","hu","is","in","id","ir","iq","ie","im","il","it","jm","jp","je","jo","kz",
+            "ke","ki","xk","kw","kg","la","lv","lb","ls","lr","ly","li","lt","lu","mo","mk","mg",
+            "mw","my","mv","ml","mt","mh","mq","mr","mu","yt","mx","fm","md","mc","mn","me","ms",
+            "ma","mz","mm","na","nr","np","nl","nc","nz","ni","ne","ng","nu","nf","kp","mp","no",
+            "om","pk","pw","ps","pa","pg","py","pe","ph","pn","pl","pt","pr","qa","re","ro","ru",
+            "rw","bl","sh","kn","lc","mf","pm","ws","sm","st","sa","sn","rs","sc","sl","sg","sx",
+            "sk","si","sb","so","za","kr","ss","es","lk","vc","sd","sr","sj","sz","se","ch","sy",
+            "tw","tj","tz","th","tl","tg","tk","to","tt","ta","tn","tr","tm","tc","tv","um","vi",
+            "ug","ua","ae","gb","us","uy","uz","vu","va","ve","vn","wf","eh","ye","zm","zw"
+        ]
+        
+        async def fetch_country(code):
+            url = f"{BASE_URL}/rankings/{code}/players"
+            async with session.get(url, headers=HEADERS) as res:
+                if res.status == 200:
+                    data = await res.json()
+                    return [p["tag"].replace("#", "").upper() for p in data.get("items", [])]
+                return []
+
+        tasks = [fetch_country(c) for c in country_codes]
+        results = await asyncio.gather(*tasks)
+        
+        all_tags = set()
+        for tags in results:
+            all_tags.update(tags)
+            
+        if all_tags:
+            formatted = [(t,) for t in all_tags]
+            cursor.executemany("INSERT OR IGNORE INTO players (tag) VALUES (?)", formatted)
+            conn.commit()
+            print(f"Parallel seeding complete. Added {len(all_tags)} unique players from {len(country_codes)} regions.")
+        else:
+            print("Failed to fetch seeds from any region.")
 
 conn = setup_db()
 
@@ -280,7 +331,7 @@ async def snowball_and_refresh_loop_async():
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT tag FROM players
-                WHERE is_processed = 0 OR profile_updated_at < datetime('now', '-7 days')
+                WHERE profile_updated_at IS NULL OR profile_updated_at < datetime('now', '-7 days')
                 LIMIT 500
             """)
             seeds = cursor.fetchall()
@@ -400,6 +451,11 @@ async def main():
     # Start DB Writer as background task
     asyncio.create_task(db_writer())
     
+    # Check for seeds
+    connector = aiohttp.TCPConnector(limit=10)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        await seed_if_empty(session)
+
     await snowball_and_refresh_loop_async()
 
 if __name__ == "__main__":

@@ -118,8 +118,9 @@ func main() {
 }
 
 func fetchUnprocessedTags(db *sql.DB, limit int) []string {
-	rows, err := db.Query("SELECT tag FROM players WHERE is_processed = 0 LIMIT ?", limit)
+	rows, err := db.Query("SELECT tag FROM players WHERE last_battlelog_scan IS NULL OR last_battlelog_scan < datetime('now', '-1 day') LIMIT ?", limit)
 	if err != nil {
+		fmt.Printf("Query Error: %v\n", err)
 		return nil
 	}
 	defer rows.Close()
@@ -214,8 +215,8 @@ func worker(jobs <-chan string, wg *sync.WaitGroup, client *http.Client, token s
 			if err := json.Unmarshal(body, &logData); err == nil {
 				processSnowball(logData, out)
 			}
-			// Mark as processed
-			_, _ = db.Exec("UPDATE players SET is_processed = 1 WHERE tag = ?", tag)
+			// Mark as scanned
+			_, _ = db.Exec("UPDATE players SET last_battlelog_scan = datetime('now') WHERE tag = ?", tag)
 		default:
 			atomic.AddUint64(&errorsHit, 1)
 		}
@@ -238,9 +239,10 @@ func processSnowball(data BattleLogResponse, out chan<- Payload) {
 
 		// Determine base winner team (for 3v3)
 		winnerTeam := -1
-		if item.Battle.Result == "victory" {
+		switch item.Battle.Result {
+		case "victory":
 			winnerTeam = 0
-		} else if item.Battle.Result == "defeat" {
+		case "defeat":
 			winnerTeam = 1
 		}
 
