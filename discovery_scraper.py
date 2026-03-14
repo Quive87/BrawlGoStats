@@ -71,7 +71,8 @@ def setup_db():
             map_id INTEGER,
             duration INTEGER,
             star_player_tag TEXT,
-            event_id INTEGER
+            event_id INTEGER,
+            mode_id INTEGER
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_filter ON matches(mode, type, battle_time);")
@@ -99,6 +100,7 @@ def setup_db():
         "ALTER TABLE match_players ADD COLUMN result TEXT",
         "ALTER TABLE match_players ADD COLUMN skin_id INTEGER",
         "ALTER TABLE matches ADD COLUMN event_id INTEGER",
+        "ALTER TABLE matches ADD COLUMN mode_id INTEGER",
         "ALTER TABLE players ADD COLUMN last_battlelog_scan TIMESTAMP",
     ):
         try:
@@ -233,6 +235,10 @@ async def fetch_battlelog(session, tag):
         pass
     return None
 
+# --- Globals ---
+seen_clubs = set()
+import random
+
 # --- Metrics ---
 stats_lock = asyncio.Lock()
 metrics = {
@@ -252,17 +258,32 @@ async def reporter_loop():
     last_req = 0
     while True:
         await asyncio.sleep(5)
+        cursor = conn.cursor()
+        
+        # Stats Queries
+        cursor.execute("SELECT COUNT(*) FROM players")
+        total_p = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM players WHERE profile_updated_at IS NOT NULL")
+        enriched_p = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM matches")
+        total_m = cursor.fetchone()[0]
+        
+        enrich_pct = (enriched_p / total_p * 100) if total_p > 0 else 0
         curr_req = metrics["req_total"]
         rate = (curr_req - last_req) / 5
         last_req = curr_req
-        print(f"[PY NET {rate:4.1f} req/s] Total: {curr_req:<7} | 429: {metrics['429_hits']:<4} | Errors: {metrics['errors']:<4} | Q: {task_queue.qsize()} DB: {db_queue.qsize()}")
+        
+        # Limit is 100 req/s (1000/10s)
+        headroom = max(0, 100 - rate)
+        
+        print(f"[PY NET {rate:4.1f} req/s] Headroom: {headroom:4.1f} | Enriched: {enriched_p}/{total_p} ({enrich_pct:2.1f}%) | Matches: {total_m:<7} | Q: {task_queue.qsize()} DB: {db_queue.qsize()}")
 
 # --- Database Writer ---
-db_queue = asyncio.Queue(maxsize=10000)
+db_queue = asyncio.Queue(maxsize=50000)
 
 async def db_writer():
     print("--- DB Writer Started ---")
-    batch_size = 1000
+    batch_size = 5000
     while True:
         ops = []
         try:
@@ -281,7 +302,7 @@ async def db_writer():
                     tag, p_data, compressed_brawlers, club_tag, club_name = data
                     cursor.execute("""
                         UPDATE players 
-                        SET profile_updated_at = CURRENT_TIMESTAMP,
+                        SET profile_updated_at = CURRENT_TIMESTAMP, is_processed = 1,
                             name = ?, icon_id = ?, trophies = ?, highest_trophies = ?, total_prestige_level = ?,
                             exp_level = ?, exp_points = ?, is_qualified_from_championship_challenge = ?,
                             victories_3v3 = ?, victories_solo = ?, victories_duo = ?,
@@ -312,22 +333,22 @@ async def db_writer():
                     """, (b_id, item_id, item_type, item_name))
                 elif type == "status_404":
                     tag = data
-                    cursor.execute("UPDATE players SET profile_updated_at = CURRENT_TIMESTAMP WHERE tag = ?", (tag,))
+                    cursor.execute("UPDATE players SET profile_updated_at = CURRENT_TIMESTAMP, is_processed = 1 WHERE tag = ?", (tag,))
                 elif type == "match":
-                    match_id, battle_time, mode, m_type, map, map_id, duration, star_tag, event_id = data
+                    match_id, battle_time, mode, m_type, map, map_id, duration, star_tag, event_id, mode_id = data
                     cursor.execute("""
-                        INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (match_id, battle_time, mode, m_type, map, map_id, duration, star_tag, event_id))
+                        INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id, mode_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (match_id, battle_time, mode, m_type, map, map_id, duration, star_tag, event_id, mode_id))
                 elif type == "match_player":
-                    m_id, p_tag, b_name, b_id, b_power, b_trophies, s_name, s_id, is_winner, team_id, t_change, result = data
+                    m_id, p_tag, b_name, b_id, b_power, b_trophies, is_winner, team_id, t_change, result = data
                     cursor.execute("INSERT OR IGNORE INTO players (tag) VALUES (?)", (p_tag,))
                     cursor.execute("""
                         INSERT OR IGNORE INTO match_players (
                             match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies,
-                            skin_name, skin_id, is_winner, team_id, trophy_change, result
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (m_id, p_tag, b_name, b_id, b_power, b_trophies, s_name, s_id, is_winner, team_id, t_change, result))
+                            is_winner, team_id, trophy_change, result
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (m_id, p_tag, b_name, b_id, b_power, b_trophies, is_winner, team_id, t_change, result))
                 elif type == "scan_done":
                     tag = data
                     cursor.execute("UPDATE players SET last_battlelog_scan = CURRENT_TIMESTAMP WHERE tag = ?", (tag,))
@@ -350,10 +371,8 @@ async def queue_profile_data(tag, p_data):
     brawlers_json = json.dumps(p_data.get("brawlers", []))
     compressed_brawlers = compress_data(brawlers_json)
 
-    # Queue profile update
     await db_queue.put(("profile", (tag, p_data, compressed_brawlers, club_tag, club_name)))
 
-    # Queue brawlers and builds
     for brawler in p_data.get("brawlers", []):
         b_id = brawler["id"]
         skin = brawler.get("skin") or {}
@@ -362,29 +381,37 @@ async def queue_profile_data(tag, p_data):
         for key, item_type in [("gadgets", "gadget"), ("starPowers", "starpower"), ("gears", "gear"), ("hyperCharges", "hypercharge")]:
             for item in brawler.get(key, []):
                 await db_queue.put(("build", (b_id, item["id"], item_type, item["name"])))
+    
+    return club_tag
 
 async def queue_battlelog_data(tag, log_data):
     if not log_data or "items" not in log_data: return
     
     for item in log_data["items"]:
+        if item["battle"].get("type") == "friendly": continue
+        
         match_id_base = item.get("battleTime", "")
         mode = item.get("event", {}).get("mode") or item.get("battle", {}).get("mode", "")
+        mode_id = item.get("event", {}).get("modeId")
         map_name = item.get("event", {}).get("map")
         map_id = item.get("event", {}).get("id")
         duration = item.get("battle", {}).get("duration", 0)
         star_player = item.get("battle", {}).get("starPlayer", {})
         star_tag = star_player.get("tag", "").replace("#", "").upper() if star_player else None
         
+        # Match-level trophy change
+        battle_trophy_change = item["battle"].get("trophyChange", 0)
+
         winner_team = -1
-        if item["battle"].get("result") == "victory":
-            winner_team = 0
-        elif item["battle"].get("result") == "defeat":
-            winner_team = 1
+        if item["battle"].get("result") == "victory": winner_team = 0
+        elif item["battle"].get("result") == "defeat": winner_team = 1
 
         players_to_process = []
         all_tags = []
 
-        battle_trophy_change = item["battle"].get("trophyChange", 0)
+        is_showdown = "Showdown" in mode
+        
+        # Standard team-based modes
         for i, team in enumerate(item["battle"].get("teams", [])):
             for p in team:
                 p_tag = p["tag"].replace("#", "").upper()
@@ -393,94 +420,103 @@ async def queue_battlelog_data(tag, log_data):
                 players_to_process.append({
                     "tag": p_tag, "name": p.get("name"), "team_id": i, "is_winner": is_winner,
                     "result": "victory" if is_winner else "defeat", "brawlers": p.get("brawlers", [p.get("brawler")]),
-                    "trophy_change": p.get("trophyChange") if p.get("trophyChange") is not None else battle_trophy_change
+                    "trophy_change": battle_trophy_change # Use battle level change
                 })
 
+        # Solo modes (soloShowdown, etc)
         for p in item["battle"].get("players", []):
             p_tag = p["tag"].replace("#", "").upper()
             all_tags.append(p_tag)
+            
+            # Showdown specific win logic (Top 4 win trophies)
             is_winner = 1 if (mode == "soloShowdown" and item["battle"].get("rank", 99) <= 4) or item["battle"].get("result") == "victory" else 0
+            
             players_to_process.append({
                 "tag": p_tag, "name": p.get("name"), "team_id": 0, "is_winner": is_winner,
                 "result": "victory" if is_winner else "defeat", "brawlers": p.get("brawlers", [p.get("brawler")]),
-                "trophy_change": p.get("trophyChange") if p.get("trophyChange") is not None else battle_trophy_change
+                "trophy_change": battle_trophy_change
             })
 
         if not all_tags: continue
         all_tags.sort()
-        event_id = map_id  # event.id for match_id hash and matches.event_id
-        tags_hash = hashlib.sha256(f"{match_id_base}|{event_id}|{','.join(all_tags)}|{map_name}".encode()).hexdigest()
+        tags_hash = hashlib.sha256(f"{match_id_base}|{map_id or map_name}|{','.join(all_tags)}".encode()).hexdigest()
         match_id = f"{match_id_base}-{tags_hash[:16]}"
 
-        await db_queue.put(("match", (match_id, match_id_base, mode, item["battle"].get("type"), map_name, map_id, duration, star_tag, event_id)))
+        await db_queue.put(("match", (match_id, match_id_base, mode, item["battle"].get("type"), map_name, map_id, duration, star_tag, map_id, mode_id)))
 
         for p in players_to_process:
             for b in p["brawlers"]:
                 if not b: continue
-                skin = b.get("skin", {})
-                s_name = skin.get("name") if isinstance(skin, dict) else None
-                s_id = skin.get("id") if isinstance(skin, dict) else 0
-                t_change = b.get("trophyChange") or p["trophy_change"]
-                await db_queue.put(("match_player", (match_id, p["tag"], b.get("name"), b.get("id"), b.get("power"), b.get("trophies"), s_name, s_id, p["is_winner"], p["team_id"], t_change, p["result"])))
-
-# --- High-Speed Parallel Workers ---
-task_queue = asyncio.Queue(maxsize=5000)
+                # Skins are NOT in battlelogs (confirmed)
+                await db_queue.put(("match_player", (match_id, p["tag"], b.get("name"), b.get("id"), b.get("power"), b.get("trophies"), p["is_winner"], p["team_id"], p["trophy_change"], p["result"])))
 
 async def worker_task(session):
     while True:
         tag = await task_queue.get()
         try:
-            # Profile Enrichment (Priority 1)
+            # 1. Profile Enrichment
             p_res = await fetch_profile(session, tag)
             await update_metrics("req")
+            
             if p_res[2] == 200:
-                await queue_profile_data(tag, p_res[1])
+                club_tag = await queue_profile_data(tag, p_res[1])
+                # Club Snowballing
+                if club_tag and club_tag not in seen_clubs:
+                    c_url = f"{BASE_URL}/clubs/%23{club_tag}/members"
+                    async with session.get(c_url, headers=HEADERS) as res:
+                        if res.status == 200:
+                            c_data = await res.json()
+                            m_tags = [m["tag"] for m in c_data.get("items", [])]
+                            push_tags_batch(m_tags)
+                            seen_clubs.add(club_tag)
             elif p_res[2] == 429:
                 await update_metrics("429")
-                await asyncio.sleep(10) # Individual worker backoff
-                await task_queue.put(tag) # Re-queue for later
+                # Per-worker jitter backoff
+                await asyncio.sleep(random.uniform(1, 3))
+                await task_queue.put(tag) # re-queue
                 continue
             elif p_res[2] == 404:
                 await db_queue.put(("status_404", tag))
 
-            # Battlelog Discovery (Parallel with Profile)
+            # 2. Battlelog Discovery
             b_res = await fetch_battlelog(session, tag)
             await update_metrics("req")
             if b_res:
                 await queue_battlelog_data(tag, b_res)
                 await db_queue.put(("scan_done", tag))
+                
         except Exception as e:
             await update_metrics("error")
         finally:
             task_queue.task_done()
 
+# --- High-Speed Infrastructure ---
+task_queue = asyncio.Queue(maxsize=25000)
+
 async def main_loop_antigravity():
-    print("--- [ANTIGRAVITY] Continuous Worker Pool Started ---")
+    print("--- [ANTIGRAVITY] BrawlGo Engine v2.0 Started ---")
     
-    num_workers = 150 # 150 parallel workers per user request
+    num_workers = 500 
     connector = aiohttp.TCPConnector(limit=num_workers, ttl_dns_cache=300)
     
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Initial seeding
         await seed_if_empty(session)
         
-        # Start workers
         for _ in range(num_workers):
             asyncio.create_task(worker_task(session))
         
-        # Continuous Feeder
         while True:
             if task_queue.qsize() < 1000:
                 cursor = conn.cursor()
-                # Prioritize enrichment where discovery is already done (optimize quota)
-                cursor.execute("""
-                    SELECT tag FROM players
-                    WHERE profile_updated_at IS NULL
-                    OR last_battlelog_scan IS NULL
-                    OR profile_updated_at < datetime('now', '-3 days')
-                    LIMIT 2000
-                """)
+                
+                # Priority 1: Never-enriched players
+                cursor.execute("SELECT tag FROM players WHERE profile_updated_at IS NULL LIMIT 10000")
                 seeds = cursor.fetchall()
+                
+                # Priority 2: Stale profiles (backfill)
+                if len(seeds) < 500:
+                    cursor.execute("SELECT tag FROM players WHERE profile_updated_at < datetime('now', '-3 days') LIMIT 10000")
+                    seeds += cursor.fetchall()
 
                 if not seeds:
                     print("All caught up! Idling 30s...")
@@ -488,11 +524,12 @@ async def main_loop_antigravity():
                     continue
 
                 for (tag,) in seeds:
-                    await task_queue.put(tag)
+                    try: task_queue.put_nowait(tag)
+                    except asyncio.QueueFull: break
                 
-                print(f"Fed {len(seeds)} tags to queue. Q-Size: {task_queue.qsize()}")
+                print(f"Fed {len(seeds)} tags to engine. Q-Limit: 25k")
             
-            await asyncio.sleep(5) # Throttled feeder to match worker consumption
+            await asyncio.sleep(5)
 
 async def main():
     if not SUPERCELL_API_TOKEN:
