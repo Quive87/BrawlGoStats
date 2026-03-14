@@ -547,16 +547,34 @@ def get_brawler_trend(
 @app.get("/meta/skins", summary="Global Skin Popularity")
 @cached(cache_5m)
 def get_skin_popularity(brawler: Optional[str] = None):
+    """Skin usage from match_players (battle log). Falls back to player_brawlers if no match data."""
     conn = get_db()
-    query = "SELECT brawler_name, brawler_id, skin_name, COUNT(*) as count FROM player_brawlers WHERE skin_name IS NOT NULL AND skin_name != ''"
     params = []
+    # Prefer match_players (battle log) – we have 138k+ matches with skin_id/skin_name
+    query = """
+        SELECT brawler_name, brawler_id, COALESCE(skin_name, '') as skin_name, COUNT(*) as count
+        FROM match_players
+        WHERE (skin_id IS NOT NULL AND skin_id != 0) OR (skin_name IS NOT NULL AND skin_name != '')
+    """
     if brawler:
-        query += " AND (brawler_name = ? OR brawler_id = ?)"
-        params.append(brawler)
-        params.append(brawler)
-    query += " GROUP BY brawler_name, skin_name ORDER BY count DESC LIMIT 200"
-    
+        try:
+            bid = int(brawler)
+            query += " AND brawler_id = ?"
+            params.append(bid)
+        except ValueError:
+            query += " AND brawler_name = ?"
+            params.append(brawler)
+    query += " GROUP BY brawler_id, COALESCE(skin_id, 0), COALESCE(skin_name, '') ORDER BY count DESC LIMIT 200"
     results = conn.execute(query, params).fetchall()
+    if not results:
+        # Fallback: profile-based skin stats (player_brawlers)
+        query = "SELECT brawler_name, brawler_id, skin_name, COUNT(*) as count FROM player_brawlers WHERE skin_name IS NOT NULL AND skin_name != ''"
+        params = []
+        if brawler:
+            query += " AND (brawler_name = ? OR brawler_id = ?)"
+            params.extend([brawler, brawler])
+        query += " GROUP BY brawler_name, skin_name ORDER BY count DESC LIMIT 200"
+        results = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in results]
 

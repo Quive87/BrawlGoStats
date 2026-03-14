@@ -1,40 +1,63 @@
-import sqlite3
+#!/usr/bin/env python3
+"""
+Reset BrawlGo SQLite database (wipe + optional backup).
+Use after deploying fresh schema or to start ingestion from scratch.
+
+Local:  python vps_reset_db.py [--yes]
+VPS:    python vps_reset_db.py --vps [--yes]
+"""
+import argparse
 import os
 import shutil
+import sys
 
-DB_NAME = "brawl_data.sqlite"
+DEFAULT_DB = "brawl_data.sqlite"
+VPS_DB = "/var/www/BrawlGoStats/brawl_data.sqlite"
 
-def reset_database():
-    print("--- BrawlGo Security Reset Service ---")
-    
-    # 1. Ask for confirmation (simulated via script logic)
-    if os.path.exists(DB_NAME):
-        backup_name = f"{DB_NAME}.bak"
-        print(f"Creating backup: {backup_name}...")
-        shutil.copy2(DB_NAME, backup_name)
-        
-        print("Stopping services (if manual)...")
-        # In a script, we assume the user stops services or we just handle the file.
-        
-        print(f"Wiping {DB_NAME}...")
-        os.remove(DB_NAME)
-        
-        # Also remove WAL files if they exist
-        if os.path.exists(f"{DB_NAME}-wal"): os.remove(f"{DB_NAME}-wal")
-        if os.path.exists(f"{DB_NAME}-shm"): os.remove(f"{DB_NAME}-shm")
-        
-        print("Database wiped successfully!")
-    else:
-        print("No database found to wipe.")
 
-    print("\nNext Steps:")
-    print("1. Restart the Discovery Scraper: sudo systemctl start brawl-discovery")
-    print("2. It will recreate the schema automatically.")
-    print("3. Then start the worker: sudo systemctl start brawl-worker")
+def reset_database(db_path: str, backup: bool = True) -> None:
+    if not os.path.exists(db_path):
+        print(f"No database at {db_path}. Nothing to wipe.")
+        return
+
+    if backup:
+        backup_name = f"{db_path}.bak"
+        print(f"Backing up to {backup_name} ...")
+        shutil.copy2(db_path, backup_name)
+
+    print(f"Removing {db_path} ...")
+    os.remove(db_path)
+    for suffix in ("-wal", "-shm"):
+        p = db_path + suffix
+        if os.path.exists(p):
+            os.remove(p)
+            print(f"Removed {p}")
+    print("Database wiped.")
+
+    print("\nNext steps:")
+    print("  1. Start discovery (creates schema): systemctl start brawl-discovery")
+    print("  2. Start worker:                    systemctl start brawl-worker")
+    print("  3. (Optional) Restart API:           systemctl restart brawl-api")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Wipe BrawlGo SQLite DB (optional backup).")
+    ap.add_argument("--vps", action="store_true", help="Use VPS path /var/www/BrawlGoStats/brawl_data.sqlite")
+    ap.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    ap.add_argument("--no-backup", action="store_true", help="Do not create a backup file")
+    args = ap.parse_args()
+
+    db_path = VPS_DB if args.vps else os.path.join(os.path.dirname(__file__) or ".", DEFAULT_DB)
+
+    if not args.yes:
+        confirm = input(f"Wipe {db_path}? This cannot be undone. [y/N]: ")
+        if confirm.strip().lower() != "y":
+            print("Cancelled.")
+            return 0
+
+    reset_database(db_path, backup=not args.no_backup)
+    return 0
+
 
 if __name__ == "__main__":
-    confirm = input("Are you SURE you want to wipe the database? This cannot be undone. (y/N): ")
-    if confirm.lower() == 'y':
-        reset_database()
-    else:
-        print("Reset cancelled.")
+    sys.exit(main())

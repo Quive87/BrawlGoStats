@@ -107,6 +107,18 @@ def setup_db():
             if "duplicate column" not in str(e).lower():
                 raise
 
+    # Profile-based brawler/skin stats (used by /meta/skins when populated)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS player_brawlers (
+            player_tag TEXT,
+            brawler_id INTEGER,
+            brawler_name TEXT,
+            trophies INTEGER,
+            skin_id INTEGER,
+            skin_name TEXT,
+            PRIMARY KEY (player_tag, brawler_id)
+        )
+    """)
     # Brawler Build Stats Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS brawler_build_stats (
