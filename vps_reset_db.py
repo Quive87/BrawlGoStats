@@ -4,18 +4,35 @@ Reset BrawlGo SQLite database (wipe + optional backup).
 Use after deploying fresh schema or to start ingestion from scratch.
 
 Local:  python vps_reset_db.py [--yes]
-VPS:    python vps_reset_db.py --vps [--yes]
+VPS:    python vps_reset_db.py --vps [--yes]   # stops discovery + worker before wipe
 """
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 
 DEFAULT_DB = "brawl_data.sqlite"
 VPS_DB = "/var/www/BrawlGoStats/brawl_data.sqlite"
+SERVICES = ["brawl-discovery", "brawl-worker"]
 
 
-def reset_database(db_path: str, backup: bool = True) -> None:
+def stop_services() -> bool:
+    """Stop workers so they release the DB. Returns True if all stopped (or already inactive)."""
+    for name in SERVICES:
+        r = subprocess.run(["systemctl", "stop", name], capture_output=True, text=True)
+        if r.returncode != 0 and "not loaded" not in (r.stderr or "").lower():
+            print(f"Warning: systemctl stop {name} -> {r.stderr or r.stdout or r.returncode}")
+        else:
+            print(f"Stopped {name}.")
+    return True
+
+
+def reset_database(db_path: str, backup: bool = True, stop_workers: bool = False) -> None:
+    if stop_workers:
+        print("Stopping services so they release the database ...")
+        stop_services()
+
     if not os.path.exists(db_path):
         print(f"No database at {db_path}. Nothing to wipe.")
         return
@@ -55,7 +72,11 @@ def main() -> int:
             print("Cancelled.")
             return 0
 
-    reset_database(db_path, backup=not args.no_backup)
+    reset_database(
+        db_path,
+        backup=not args.no_backup,
+        stop_workers=args.vps,
+    )
     return 0
 
 

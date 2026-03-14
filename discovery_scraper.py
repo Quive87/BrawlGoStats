@@ -26,7 +26,7 @@ HEADERS = {
     "Authorization": f"Bearer {SUPERCELL_API_TOKEN}",
     "Accept": "application/json"
 }
-BASE_URL = "https://bs.royalapi.com/v1"
+BASE_URL = "https://api.brawlstars.com/v1"
 DB_NAME = "/var/www/BrawlGoStats/brawl_data.sqlite"
 
 # --- SQLite Setup ---
