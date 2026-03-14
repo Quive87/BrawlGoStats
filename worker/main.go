@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	dbPath        = "../brawl_data.sqlite"
+	dbPath        = "/var/www/BrawlGoStats/brawl_data.sqlite"
 	baseURL       = "https://api.brawlstars.com/v1"
 	poolSize      = 64   // Increased concurrent workers
 	batchLoadSize = 1000 // Larger batch to reduce DB contention

@@ -1,7 +1,7 @@
 import sqlite3
 import os
 
-DB_NAME = "brawl_data.sqlite"
+DB_NAME = "/var/www/BrawlGoStats/brawl_data.sqlite"
 
 def migrate():
     if not os.path.exists(DB_NAME):
@@ -92,6 +92,22 @@ def migrate():
             print("Successfully updated 'match_players' Primary Key.")
     except Exception as e:
         print(f"Error migrating match_players: {e}")
+
+    try:
+        print("Creating 'player_brawlers' table for profile-based skin/brawler stats...")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_brawlers (
+                player_tag TEXT,
+                brawler_id INTEGER,
+                brawler_name TEXT,
+                trophies INTEGER,
+                skin_id INTEGER,
+                skin_name TEXT,
+                PRIMARY KEY (player_tag, brawler_id)
+            )
+        """)
+    except Exception as e:
+        print(f"Error creating player_brawlers table: {e}")
 
     try:
         print("Creating 'brawler_build_stats' table...")

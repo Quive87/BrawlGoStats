@@ -1,0 +1,142 @@
+
+--- Profile: %23P8CY9JGQR ---
+Keys: ['tag', 'name', 'nameColor', 'icon', 'trophies', 'highestTrophies', 'totalPrestigeLevel', 'expLevel', 'expPoints', 'isQualifiedFromChampionshipChallenge', '3vs3Victories', 'soloVictories', 'duoVictories', 'bestRoboRumbleTime', 'bestTimeAsBigBrawler', 'club', 'brawlers']
+Icon: {'id': 28001098}
+Sample Brawler: {
+  "id": 16000000,
+  "name": "SHELLY",
+  "power": 9,
+  "rank": 3,
+  "trophies": 615,
+  "highestTrophies": 636,
+  "prestigeLevel": 0,
+  "currentWinStreak": 1,
+  "maxWinStreak": 11,
+  "skin": {
+    "id": 29000358,
+    "name": "PRINCESS SHELLY"
+  },
+  "gadgets": [
+    {
+      "id": 23000255,
+      "name": "FAST FORWARD"
+    },
+    {
+      "id": 23000288,
+      "name": "CLAY PIGEONS"
+    }
+  ],
+  "gears": [],
+  "starPowers": [
+    {
+      "id": 23000076,
+      "name": "SHELL SHOCK"
+    },
+    {
+      "id": 23000135,
+      "name": "BAND-AID"
+    }
+  ],
+  "hyperCharges": [],
+  "buffies": {
+    "gadget": false,
+    "starPower": false,
+    "hyperCharge": false
+  }
+}
+
+--- Battlelog: %23P8CY9JGQR ---
+Match Keys: ['battleTime', 'event', 'battle']
+Battle Keys: ['mode', 'type', 'result', 'duration', 'trophyChange', 'starPlayer', 'teams']
+Full First Item: {
+  "battleTime": "20260311T050604.000Z",
+  "event": {
+    "id": 15000022,
+    "mode": "bounty",
+    "modeId": 3,
+    "map": "Hideout"
+  },
+  "battle": {
+    "mode": "bounty",
+    "type": "ranked",
+    "result": "victory",
+    "duration": 113,
+    "trophyChange": 8,
+    "starPlayer": {
+      "tag": "#P8CY9JGQR",
+      "name": "\u0414ecca",
+      "brawler": {
+        "id": 16000051,
+        "name": "ASH",
+        "power": 11,
+        "trophies": 2024
+      }
+    },
+    "teams": [
+      [
+        {
+          "tag": "#9P298RPJL",
+          "name": "Ema\ud83d\udc00\ud83d\udc8e",
+          "brawler": {
+            "id": 16000029,
+            "name": "BEA",
+            "power": 11,
+            "trophies": 1950
+          }
+        },
+        {
+          "tag": "#Y8L9YJC0U",
+          "name": "123",
+          "brawler": {
+            "id": 16000015,
+            "name": "PIPER",
+            "power": 11,
+            "trophies": 1782
+          }
+        },
+        {
+          "tag": "#P8CY9JGQR",
+          "name": "\u0414ecca",
+          "brawler": {
+            "id": 16000051,
+            "name": "ASH",
+            "power": 11,
+            "trophies": 2024
+          }
+        }
+      ],
+      [
+        {
+          "tag": "#PG02QQCPP",
+          "name": "BS |nOOb\u201d)",
+          "brawler": {
+            "id": 16000023,
+            "name": "LEON",
+            "power": 11,
+            "trophies": 1186
+          }
+        },
+        {
+          "tag": "#VC920P",
+          "name": "Iman",
+          "brawler": {
+            "id": 16000036,
+            "name": "NANI",
+            "power": 11,
+            "trophies": 1210
+          }
+        },
+        {
+          "tag": "#9PQ9Q92YC",
+          "name": "\ua9c1\u4e42\u2730\ud835\ude62\u00fc\u049c\ud835\udcf8\ud835\ude34\u2730\u4e42\ua9c2",
+          "brawler": {
+            "id": 16000015,
+            "name": "PIPER",
+            "power": 11,
+            "trophies": 1751
+          }
+        }
+      ]
+    ]
+  }
+}
