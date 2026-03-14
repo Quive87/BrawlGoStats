@@ -340,6 +340,89 @@ async def db_writer():
             except: pass
             await asyncio.sleep(1)
 
+async def queue_profile_data(tag, p_data):
+    club_tag = ""
+    club_name = ""
+    if "club" in p_data and "tag" in p_data["club"]:
+        club_tag = p_data["club"]["tag"].replace("#", "")
+        club_name = p_data["club"].get("name", "")
+    
+    brawlers_json = json.dumps(p_data.get("brawlers", []))
+    compressed_brawlers = compress_data(brawlers_json)
+
+    # Queue profile update
+    await db_queue.put(("profile", (tag, p_data, compressed_brawlers, club_tag, club_name)))
+
+    # Queue brawlers and builds
+    for brawler in p_data.get("brawlers", []):
+        b_id = brawler["id"]
+        skin = brawler.get("skin") or {}
+        await db_queue.put(("brawler", (tag, b_id, brawler.get("name"), brawler.get("trophies"), skin.get("id"), skin.get("name"))))
+
+        for key, item_type in [("gadgets", "gadget"), ("starPowers", "starpower"), ("gears", "gear"), ("hyperCharges", "hypercharge")]:
+            for item in brawler.get(key, []):
+                await db_queue.put(("build", (b_id, item["id"], item_type, item["name"])))
+
+async def queue_battlelog_data(tag, log_data):
+    if not log_data or "items" not in log_data: return
+    
+    for item in log_data["items"]:
+        match_id_base = item.get("battleTime", "")
+        mode = item.get("event", {}).get("mode") or item.get("battle", {}).get("mode", "")
+        map_name = item.get("event", {}).get("map")
+        map_id = item.get("event", {}).get("id")
+        duration = item.get("battle", {}).get("duration", 0)
+        star_player = item.get("battle", {}).get("starPlayer", {})
+        star_tag = star_player.get("tag", "").replace("#", "").upper() if star_player else None
+        
+        winner_team = -1
+        if item["battle"].get("result") == "victory":
+            winner_team = 0
+        elif item["battle"].get("result") == "defeat":
+            winner_team = 1
+
+        players_to_process = []
+        all_tags = []
+
+        battle_trophy_change = item["battle"].get("trophyChange", 0)
+        for i, team in enumerate(item["battle"].get("teams", [])):
+            for p in team:
+                p_tag = p["tag"].replace("#", "").upper()
+                all_tags.append(p_tag)
+                is_winner = 1 if i == winner_team or (mode == "duoShowdown" and item["battle"].get("rank", 99) <= 2) else 0
+                players_to_process.append({
+                    "tag": p_tag, "name": p.get("name"), "team_id": i, "is_winner": is_winner,
+                    "result": "victory" if is_winner else "defeat", "brawlers": p.get("brawlers", [p.get("brawler")]),
+                    "trophy_change": p.get("trophyChange") if p.get("trophyChange") is not None else battle_trophy_change
+                })
+
+        for p in item["battle"].get("players", []):
+            p_tag = p["tag"].replace("#", "").upper()
+            all_tags.append(p_tag)
+            is_winner = 1 if (mode == "soloShowdown" and item["battle"].get("rank", 99) <= 4) or item["battle"].get("result") == "victory" else 0
+            players_to_process.append({
+                "tag": p_tag, "name": p.get("name"), "team_id": 0, "is_winner": is_winner,
+                "result": "victory" if is_winner else "defeat", "brawlers": p.get("brawlers", [p.get("brawler")]),
+                "trophy_change": p.get("trophyChange") if p.get("trophyChange") is not None else battle_trophy_change
+            })
+
+        if not all_tags: continue
+        all_tags.sort()
+        event_id = map_id  # event.id for match_id hash and matches.event_id
+        tags_hash = hashlib.sha256(f"{match_id_base}|{event_id}|{','.join(all_tags)}|{map_name}".encode()).hexdigest()
+        match_id = f"{match_id_base}-{tags_hash[:16]}"
+
+        await db_queue.put(("match", (match_id, match_id_base, mode, item["battle"].get("type"), map_name, map_id, duration, star_tag, event_id)))
+
+        for p in players_to_process:
+            for b in p["brawlers"]:
+                if not b: continue
+                skin = b.get("skin", {})
+                s_name = skin.get("name") if isinstance(skin, dict) else None
+                s_id = skin.get("id") if isinstance(skin, dict) else 0
+                t_change = b.get("trophyChange") or p["trophy_change"]
+                await db_queue.put(("match_player", (match_id, p["tag"], b.get("name"), b.get("id"), b.get("power"), b.get("trophies"), s_name, s_id, p["is_winner"], p["team_id"], t_change, p["result"])))
+
 # --- High-Speed Parallel Workers ---
 task_queue = asyncio.Queue(maxsize=5000)
 
