@@ -8,7 +8,7 @@ def migrate():
         print(f"Error: {DB_NAME} not found.")
         return
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     cursor = conn.cursor()
 
     print(f"Starting migration for {DB_NAME}...")
