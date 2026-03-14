@@ -222,9 +222,9 @@
         </div>
 
         <div class="grid">
-            <!-- Worker Throughput -->
+            <!-- Enrichment Progress -->
             <div class="card">
-                <div class="card-label">Throughput / Processed</div>
+                <div class="card-label">Profile Enrichment</div>
                 <div id="sync-rate" class="card-value">0.0%</div>
                 <div id="sync-numbers" class="card-subtext">Loading tags...</div>
                 <div class="progress-wrapper">
@@ -285,7 +285,7 @@
 
                 // Update Throughput
                 document.getElementById('sync-rate').innerText = data.sync_progress.sync_rate;
-                document.getElementById('sync-numbers').innerText = `${data.sync_progress.processed_players.toLocaleString()} of ${data.sync_progress.total_players.toLocaleString()} Profiles`;
+                document.getElementById('sync-numbers').innerText = `${data.sync_progress.enriched_players.toLocaleString()} of ${data.sync_progress.total_players.toLocaleString()} Enriched`;
                 document.getElementById('sync-progress').style.width = data.sync_progress.sync_rate;
                 
                 // Update Matches
@@ -333,7 +333,7 @@
 
                 // Update Sync Stats
                 document.getElementById('sync-rate').innerText = data.sync_progress.sync_rate;
-                document.getElementById('sync-numbers').innerText = `${data.sync_progress.processed_players.toLocaleString()} / ${data.sync_progress.total_players.toLocaleString()} Players`;
+                document.getElementById('sync-numbers').innerText = `${data.sync_progress.enriched_players.toLocaleString()} / ${data.sync_progress.total_players.toLocaleString()} Players`;
                 document.getElementById('sync-progress').style.width = data.sync_progress.sync_rate;
                 document.getElementById('total-matches').innerText = data.sync_progress.stored_matches.toLocaleString();
 

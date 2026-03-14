@@ -36,7 +36,7 @@ def get_dashboard():
         return "<h1>Dashboard file not found. Please ensure dashboard.html exists.</h1>"
     with open(dashboard_path, "r", encoding="utf-8") as f:
         return f.read()
-DB_PATH = "brawl_data.sqlite"
+DB_PATH = "/var/www/BrawlGoStats/brawl_data.sqlite"
 dctx = zstd.ZstdDecompressor()
 
 # High-performance in-memory cache for analytical queries (5 minutes TTL)
@@ -78,7 +78,7 @@ def health_check():
         stats = conn.execute("""
             SELECT 
                 (SELECT COUNT(*) FROM players) as total_players,
-                (SELECT COUNT(*) FROM players WHERE is_processed = 1) as processed_players,
+                (SELECT COUNT(*) FROM players WHERE profile_updated_at IS NOT NULL) as enriched_players,
                 (SELECT COUNT(*) FROM matches) as total_matches
         """).fetchone()
         
@@ -95,8 +95,8 @@ def health_check():
             },
             "sync_progress": {
                 "total_players": stats["total_players"],
-                "processed_players": stats["processed_players"],
-                "sync_rate": f"{round((stats['processed_players'] / max(1, stats['total_players'])) * 100, 1)}%",
+                "enriched_players": stats["enriched_players"],
+                "sync_rate": f"{round((stats['enriched_players'] / max(1, stats['total_players'])) * 100, 1)}%",
                 "stored_matches": stats["total_matches"]
             },
             "system": {
@@ -544,10 +544,11 @@ def get_brawler_trend(
 @cached(cache_5m)
 def get_skin_popularity(brawler: Optional[str] = None):
     conn = get_db()
-    query = "SELECT brawler_name, brawler_id, skin_name, COUNT(*) as count FROM match_players WHERE skin_name IS NOT NULL AND LENGTH(skin_name) > 0"
+    query = "SELECT brawler_name, brawler_id, skin_name, COUNT(*) as count FROM player_brawlers WHERE skin_name IS NOT NULL AND skin_name != ''"
     params = []
     if brawler:
-        query += " AND brawler_name = ?"
+        query += " AND (brawler_name = ? OR brawler_id = ?)"
+        params.append(brawler)
         params.append(brawler)
     query += " GROUP BY brawler_name, skin_name ORDER BY count DESC LIMIT 200"
     
