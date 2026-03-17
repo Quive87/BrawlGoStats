@@ -37,6 +37,8 @@ def get_dashboard():
     with open(dashboard_path, "r", encoding="utf-8") as f:
         return f.read()
 DB_PATH = "/var/www/BrawlGoStats/brawl_data.sqlite"
+if not os.path.exists(DB_PATH):
+    DB_PATH = "brawl_data.sqlite"
 dctx = zstd.ZstdDecompressor()
 
 # High-performance in-memory cache for analytical queries (5 minutes TTL)
@@ -175,121 +177,88 @@ def get_player_battlelog(
         
     match_ids = [row["match_id"] for row in match_ids_rows]
     
-    # 2. Fetch all participants and match metadata for these matches
+    # 2. Fetch raw data if available from matches table
     placeholders = ",".join(["?"] * len(match_ids))
-    query = f"""
-        SELECT m.*, mp.*, p.name as player_name
-        FROM matches m
-        JOIN match_players mp ON m.match_id = mp.match_id
-        LEFT JOIN players p ON mp.player_tag = p.tag
-        WHERE m.match_id IN ({placeholders})
-        ORDER BY m.battle_time DESC
-    """
-    all_data = conn.execute(query, match_ids).fetchall()
-    conn.close()
-
-    # 3. Group data by match_id
-    matches_map = {}
-    for row in all_data:
-        mid = row["match_id"]
-        tag = row["player_tag"]
-        mode = row["mode"].lower()
-        
-        if mid not in matches_map:
-            matches_map[mid] = {
-                "battleTime": row["battle_time"],
-                "event": {
-                    "mode": row["mode"],
-                    "map": row["map"]
-                },
-                "battle": {
-                    "mode": row["mode"],
-                    "type": row["type"],
-                    "duration": row["duration"],
-                    "starPlayer": {"tag": "#" + row["star_player_tag"]} if row["star_player_tag"] else None,
-                    "teams": [],
-                    "players": []
-                },
-                "_players_index": {} # Internal helper to group brawlers for Duels
-            }
-        
-        m = matches_map[mid]
-        
-        # Brawler object for this row
-        brawler_obj = {
-            "id": row["brawler_id"],
-            "name": row["brawler_name"],
-            "power": row["brawler_power"],
-            "trophies": row["brawler_trophies"],
-            "trophyChange": row["trophy_change"],
-            "skin": {"id": row["skin_id"], "name": row["skin_name"]}
-        }
-
-        if tag not in m["_players_index"]:
-            player_obj = {
-                "tag": "#" + tag,
-                "name": row["player_name"],
-                "result": row["result"]
-            }
-            
-            if mode == "duels":
-                player_obj["brawlers"] = [brawler_obj]
-            else:
-                player_obj["brawler"] = brawler_obj
-                player_obj["trophyChange"] = row["trophy_change"]
-            
-            m["_players_index"][tag] = player_obj
-            
-            # Place in teams vs players
-            if mode == "soloshowdown" or mode == "solo showdown":
-                m["battle"]["players"].append(player_obj)
-            else:
-                # 3v3 / Duels / Duo Showdown use 'teams'
-                team_id = row["team_id"] or 0
-                while len(m["battle"]["teams"]) <= team_id:
-                    m["battle"]["teams"].append([])
-                m["battle"]["teams"][team_id].append(player_obj)
-        else:
-            # Player already exists (Duels) - just add the brawler
-            if mode == "duels":
-                m["_players_index"][tag]["brawlers"].append(brawler_obj)
-
-    # Convert map to sorted list and clean up internal index
+    matches_rows = conn.execute(f"SELECT match_id, raw_data FROM matches WHERE match_id IN ({placeholders})", match_ids).fetchall()
+    
     items = []
-    for mid in matches_map:
-        m = matches_map[mid]
-        del m["_players_index"]
-        items.append(m)
+    fallback_ids = []
+    
+    for row in matches_rows:
+        if row["raw_data"]:
+            try:
+                # Direct decompression of official API item format
+                item = json.loads(dctx.decompress(row["raw_data"]).decode('utf-8'))
+                items.append(item)
+            except:
+                fallback_ids.append(row["match_id"])
+        else:
+            fallback_ids.append(row["match_id"])
+
+    # 3. Fallback for matches without raw_data (legacy or from Go worker)
+    if fallback_ids:
+        fb_placeholders = ",".join(["?"] * len(fallback_ids))
+        query = f"""
+            SELECT m.*, mp.*, p.name as player_name
+            FROM matches m
+            JOIN match_players mp ON m.match_id = mp.match_id
+            LEFT JOIN players p ON mp.player_tag = p.tag
+            WHERE m.match_id IN ({fb_placeholders})
+            ORDER BY m.battle_time DESC
+        """
+        all_data = conn.execute(query, fallback_ids).fetchall()
         
+        # Group data by match_id (Legacy reconstruction logic)
+        matches_map = {}
+        for row in all_data:
+            mid = row["match_id"]
+            p_tag = row["player_tag"]
+            mode = row["mode"].lower()
+            
+            if mid not in matches_map:
+                matches_map[mid] = {
+                    "battleTime": row["battle_time"],
+                    "event": {"mode": row["mode"], "map": row["map"]},
+                    "battle": {
+                        "mode": row["mode"], "type": row["type"], "duration": row["duration"],
+                        "starPlayer": {"tag": "#" + row["star_player_tag"]} if row["star_player_tag"] else None,
+                        "teams": [], "players": []
+                    },
+                    "_players_index": {}
+                }
+            
+            m = matches_map[mid]
+            brawler_obj = {
+                "id": row["brawler_id"], "name": row["brawler_name"],
+                "power": row["brawler_power"], "trophies": row["brawler_trophies"],
+                "trophyChange": row["trophy_change"]
+            }
+
+            if p_tag not in m["_players_index"]:
+                player_obj = {"tag": "#" + p_tag, "name": row["player_name"], "result": row["result"]}
+                if mode == "duels":
+                    player_obj["brawlers"] = [brawler_obj]
+                else:
+                    player_obj["brawler"] = brawler_obj
+                    player_obj["trophyChange"] = row["trophy_change"]
+                
+                m["_players_index"][p_tag] = player_obj
+                if "showdown" in mode:
+                    m["battle"]["players"].append(player_obj)
+                else:
+                    team_id = row["team_id"] or 0
+                    while len(m["battle"]["teams"]) <= team_id: m["battle"]["teams"].append([])
+                    m["battle"]["teams"][team_id].append(player_obj)
+            elif mode == "duels":
+                m["_players_index"][p_tag]["brawlers"].append(brawler_obj)
+
+        for mid in matches_map:
+            m = matches_map[mid]
+            del m["_players_index"]
+            items.append(m)
+
+    conn.close()
     items.sort(key=lambda x: x["battleTime"], reverse=True)
-    
-    # 4. Enrichment: Calculate missing trophy changes
-    from trophy_logic import calculate_trophy_change
-    for item in items:
-        # We only enrich the player's own battle object if trophyChange is 0 or None
-        # and it's a 'ranked' type match
-        if item["battle"].get("type") != "ranked":
-            continue
-            
-        # Re-traverse to find the main player's object
-        players_to_check = item["battle"]["players"]
-        for team in item["battle"]["teams"]:
-            players_to_check.extend(team)
-            
-        for p in players_to_check:
-            if p["tag"].replace("#", "") == tag:
-                # If trophy change is missing, attempt to calculate
-                # Note: This is a best-effort prediction
-                if not p.get("trophyChange") or p["trophyChange"] == 0:
-                    tc = calculate_trophy_change(
-                        item["battle"]["mode"],
-                        p["brawler"]["trophies"],
-                        rank=item["battle"].get("rank"),
-                        result=p.get("result")
-                    )
-                    if tc != 0:
-                        p["trophyChange"] = tc
-    
     return {"items": items}
 
 @app.get("/meta/trophy-table", summary="Get Trophy Change Brackets")

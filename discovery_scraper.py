@@ -28,6 +28,8 @@ HEADERS = {
 }
 BASE_URL = "https://api.brawlstars.com/v1"
 DB_NAME = "/var/www/BrawlGoStats/brawl_data.sqlite"
+if not os.path.exists(DB_NAME):
+    DB_NAME = "brawl_data.sqlite"
 
 # --- SQLite Setup ---
 def setup_db():
@@ -72,7 +74,8 @@ def setup_db():
             duration INTEGER,
             star_player_tag TEXT,
             event_id INTEGER,
-            mode_id INTEGER
+            mode_id INTEGER,
+            raw_data BLOB
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_filter ON matches(mode, type, battle_time);")
@@ -101,6 +104,7 @@ def setup_db():
         "ALTER TABLE match_players ADD COLUMN skin_id INTEGER",
         "ALTER TABLE matches ADD COLUMN event_id INTEGER",
         "ALTER TABLE matches ADD COLUMN mode_id INTEGER",
+        "ALTER TABLE matches ADD COLUMN raw_data BLOB",
         "ALTER TABLE players ADD COLUMN last_battlelog_scan TIMESTAMP",
     ):
         try:
@@ -297,8 +301,22 @@ async def db_writer():
                     break
             
             cursor = conn.cursor()
+            
+            # Group operations by type for batch processing
+            grouped_ops = {}
             for type, data in ops:
-                if type == "profile":
+                if type not in grouped_ops:
+                    grouped_ops[type] = []
+                grouped_ops[type].append(data)
+
+            # 1. Process Tags first (dependency for match_player)
+            if "match_player" in grouped_ops:
+                tags = [(d[1],) for d in grouped_ops["match_player"]]
+                cursor.executemany("INSERT OR IGNORE INTO players (tag) VALUES (?)", tags)
+
+            # 2. Process Profiles
+            if "profile" in grouped_ops:
+                for data in grouped_ops["profile"]:
                     tag, p_data, compressed_brawlers, club_tag, club_name = data
                     cursor.execute("""
                         UPDATE players 
@@ -316,42 +334,49 @@ async def db_writer():
                         p_data.get("3vs3Victories", 0), p_data.get("soloVictories", 0), p_data.get("duoVictories", 0),
                         club_tag, club_name, compressed_brawlers, tag
                     ))
-                elif type == "brawler":
-                    tag, b_id, b_name, b_trophies, s_id, s_name = data
-                    cursor.execute("""
-                        INSERT INTO player_brawlers (player_tag, brawler_id, brawler_name, trophies, skin_id, skin_name)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(player_tag, brawler_id) DO UPDATE SET
-                            trophies = excluded.trophies, skin_id = excluded.skin_id, skin_name = excluded.skin_name
-                    """, (tag, b_id, b_name, b_trophies, s_id, s_name))
-                elif type == "build":
-                    b_id, item_id, item_type, item_name = data
-                    cursor.execute("""
-                        INSERT INTO brawler_build_stats (brawler_id, item_id, item_type, item_name)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(brawler_id, item_id) DO UPDATE SET equip_count = equip_count + 1
-                    """, (b_id, item_id, item_type, item_name))
-                elif type == "status_404":
-                    tag = data
-                    cursor.execute("UPDATE players SET profile_updated_at = CURRENT_TIMESTAMP, is_processed = 1 WHERE tag = ?", (tag,))
-                elif type == "match":
-                    match_id, battle_time, mode, m_type, map, map_id, duration, star_tag, event_id, mode_id = data
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id, mode_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (match_id, battle_time, mode, m_type, map, map_id, duration, star_tag, event_id, mode_id))
-                elif type == "match_player":
-                    m_id, p_tag, b_name, b_id, b_power, b_trophies, is_winner, team_id, t_change, result = data
-                    cursor.execute("INSERT OR IGNORE INTO players (tag) VALUES (?)", (p_tag,))
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO match_players (
-                            match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies,
-                            is_winner, team_id, trophy_change, result
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (m_id, p_tag, b_name, b_id, b_power, b_trophies, is_winner, team_id, t_change, result))
-                elif type == "scan_done":
-                    tag = data
-                    cursor.execute("UPDATE players SET last_battlelog_scan = CURRENT_TIMESTAMP WHERE tag = ?", (tag,))
+
+            # 3. Process Brawlers
+            if "brawler" in grouped_ops:
+                cursor.executemany("""
+                    INSERT INTO player_brawlers (player_tag, brawler_id, brawler_name, trophies, skin_id, skin_name)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(player_tag, brawler_id) DO UPDATE SET
+                        trophies = excluded.trophies, skin_id = excluded.skin_id, skin_name = excluded.skin_name
+                """, grouped_ops["brawler"])
+
+            # 4. Process Builds
+            if "build" in grouped_ops:
+                cursor.executemany("""
+                    INSERT INTO brawler_build_stats (brawler_id, item_id, item_type, item_name)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(brawler_id, item_id) DO UPDATE SET equip_count = equip_count + 1
+                """, grouped_ops["build"])
+
+            # 5. Process 404s
+            if "status_404" in grouped_ops:
+                tags = [(t,) for t in grouped_ops["status_404"]]
+                cursor.executemany("UPDATE players SET profile_updated_at = CURRENT_TIMESTAMP, is_processed = 1 WHERE tag = ?", tags)
+
+            # 6. Process matches
+            if "match" in grouped_ops:
+                cursor.executemany("""
+                    INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id, mode_id, raw_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, grouped_ops["match"])
+
+            # 7. Process match_players
+            if "match_player" in grouped_ops:
+                cursor.executemany("""
+                    INSERT OR IGNORE INTO match_players (
+                        match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies,
+                        is_winner, team_id, trophy_change, result, skin_name, skin_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, grouped_ops["match_player"])
+
+            # 8. Process scan_done
+            if "scan_done" in grouped_ops:
+                tags = [(t,) for t in grouped_ops["scan_done"]]
+                cursor.executemany("UPDATE players SET last_battlelog_scan = CURRENT_TIMESTAMP WHERE tag = ?", tags)
 
             conn.commit()
             for _ in ops: db_queue.task_done()
@@ -442,13 +467,17 @@ async def queue_battlelog_data(tag, log_data):
         tags_hash = hashlib.sha256(f"{match_id_base}|{map_id or map_name}|{','.join(all_tags)}".encode()).hexdigest()
         match_id = f"{match_id_base}-{tags_hash[:16]}"
 
-        await db_queue.put(("match", (match_id, match_id_base, mode, item["battle"].get("type"), map_name, map_id, duration, star_tag, map_id, mode_id)))
+        # Store full battle item JSON for extended battlelog format
+        raw_json = json.dumps(item)
+        compressed_raw = compress_data(raw_json)
+
+        await db_queue.put(("match", (match_id, match_id_base, mode, item["battle"].get("type"), map_name, map_id, duration, star_tag, map_id, mode_id, compressed_raw)))
 
         for p in players_to_process:
             for b in p["brawlers"]:
                 if not b: continue
                 # Skins are NOT in battlelogs (confirmed)
-                await db_queue.put(("match_player", (match_id, p["tag"], b.get("name"), b.get("id"), b.get("power"), b.get("trophies"), p["is_winner"], p["team_id"], p["trophy_change"], p["result"])))
+                await db_queue.put(("match_player", (match_id, p["tag"], b.get("name"), b.get("id"), b.get("power"), b.get("trophies"), p["is_winner"], p["team_id"], p["trophy_change"], p["result"], "", 0)))
 
 async def worker_task(session):
     while True:

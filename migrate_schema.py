@@ -2,6 +2,8 @@ import sqlite3
 import os
 
 DB_NAME = "/var/www/BrawlGoStats/brawl_data.sqlite"
+if not os.path.exists(DB_NAME):
+    DB_NAME = "brawl_data.sqlite"
 
 def migrate():
     if not os.path.exists(DB_NAME):
@@ -15,8 +17,12 @@ def migrate():
 
     try:
         # Add event_id to matches
-        print("Adding 'event_id' to 'matches'...")
+        print("Adding 'event_id' and 'raw_data' to 'matches'...")
         cursor.execute("ALTER TABLE matches ADD COLUMN event_id INTEGER;")
+    except sqlite3.OperationalError: pass # Already exists
+
+    try:
+        cursor.execute("ALTER TABLE matches ADD COLUMN raw_data BLOB;")
     except sqlite3.OperationalError: pass # Already exists
 
     try:
