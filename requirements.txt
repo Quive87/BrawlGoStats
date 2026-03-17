@@ -5,3 +5,4 @@ uvicorn
 gunicorn
 zstandard
 cachetools
+aiohttp
