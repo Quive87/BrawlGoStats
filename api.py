@@ -176,86 +176,116 @@ def get_player_battlelog(
         return {"items": []}
         
     match_ids = [row["match_id"] for row in match_ids_rows]
-    
-    # 2. Fetch raw data if available from matches table
     placeholders = ",".join(["?"] * len(match_ids))
-    matches_rows = conn.execute(f"SELECT match_id, raw_data FROM matches WHERE match_id IN ({placeholders})", match_ids).fetchall()
     
-    items = []
-    fallback_ids = []
+    # 2. Fetch all match data for these IDs
+    query = f"""
+        SELECT m.*, mp.*, p.name as p_name, p.icon_id as p_icon, p.trophies as p_trophies
+        FROM matches m
+        JOIN match_players mp ON m.match_id = mp.match_id
+        LEFT JOIN players p ON mp.player_tag = p.tag
+        WHERE m.match_id IN ({placeholders})
+        ORDER BY m.battle_time DESC
+    """
+    all_rows = conn.execute(query, match_ids).fetchall()
     
-    for row in matches_rows:
-        if row["raw_data"]:
-            try:
-                # Direct decompression of official API item format
-                item = json.loads(dctx.decompress(row["raw_data"]).decode('utf-8'))
-                items.append(item)
-            except:
-                fallback_ids.append(row["match_id"])
-        else:
-            fallback_ids.append(row["match_id"])
-
-    # 3. Fallback for matches without raw_data (legacy or from Go worker)
-    if fallback_ids:
-        fb_placeholders = ",".join(["?"] * len(fallback_ids))
-        query = f"""
-            SELECT m.*, mp.*, p.name as player_name
-            FROM matches m
-            JOIN match_players mp ON m.match_id = mp.match_id
-            LEFT JOIN players p ON mp.player_tag = p.tag
-            WHERE m.match_id IN ({fb_placeholders})
-            ORDER BY m.battle_time DESC
-        """
-        all_data = conn.execute(query, fallback_ids).fetchall()
+    matches_map = {}
+    for row in all_rows:
+        mid = row["match_id"]
+        mode = (row["mode"] or "").lower()
         
-        # Group data by match_id (Legacy reconstruction logic)
-        matches_map = {}
-        for row in all_data:
-            mid = row["match_id"]
-            p_tag = row["player_tag"]
-            mode = row["mode"].lower()
-            
-            if mid not in matches_map:
-                matches_map[mid] = {
-                    "battleTime": row["battle_time"],
-                    "event": {"mode": row["mode"], "map": row["map"]},
-                    "battle": {
-                        "mode": row["mode"], "type": row["type"], "duration": row["duration"],
-                        "starPlayer": {"tag": "#" + row["star_player_tag"]} if row["star_player_tag"] else None,
-                        "teams": [], "players": []
-                    },
-                    "_players_index": {}
-                }
-            
-            m = matches_map[mid]
-            brawler_obj = {
-                "id": row["brawler_id"], "name": row["brawler_name"],
-                "power": row["brawler_power"], "trophies": row["brawler_trophies"],
-                "trophyChange": row["trophy_change"]
+        if mid not in matches_map:
+            # Initialize match structure
+            match_obj = {
+                "battleTime": row["battle_time"],
+                "event": {
+                    "id": row["event_id"],
+                    "mode": row["mode"],
+                    "map": row["map"]
+                },
+                "battle": {
+                    "mode": mode,
+                    "type": row["type"],
+                    "duration": row["duration"]
+                },
+                "_players_temp": {} # To group multiple brawlers per player (Duels)
             }
-
-            if p_tag not in m["_players_index"]:
-                player_obj = {"tag": "#" + p_tag, "name": row["player_name"], "result": row["result"]}
-                if mode == "duels":
-                    player_obj["brawlers"] = [brawler_obj]
-                else:
-                    player_obj["brawler"] = brawler_obj
-                    player_obj["trophyChange"] = row["trophy_change"]
-                
-                m["_players_index"][p_tag] = player_obj
-                if "showdown" in mode:
-                    m["battle"]["players"].append(player_obj)
-                else:
-                    team_id = row["team_id"] or 0
-                    while len(m["battle"]["teams"]) <= team_id: m["battle"]["teams"].append([])
-                    m["battle"]["teams"][team_id].append(player_obj)
+            
+            # Mode-specific structure initialization
+            if "showdown" in mode:
+                if mode == "soloshowdown":
+                    match_obj["battle"]["players"] = []
+                else: # duoShowdown
+                    match_obj["battle"]["teams"] = []
             elif mode == "duels":
-                m["_players_index"][p_tag]["brawlers"].append(brawler_obj)
+                match_obj["battle"]["players"] = []
+            else: # 3v3, Bounty, etc.
+                match_obj["battle"]["teams"] = []
+                # Star Player (only for 3v3-like modes)
+                if row["star_player_tag"]:
+                    match_obj["battle"]["starPlayer"] = {"tag": "#" + row["star_player_tag"]}
 
-        for mid in matches_map:
-            m = matches_map[mid]
-            del m["_players_index"]
-            items.append(m)
+            matches_map[mid] = match_obj
+
+        m = matches_map[mid]
+        p_tag = row["player_tag"]
+        
+        # Build brawler object
+        brawler_obj = {
+            "id": row["brawler_id"],
+            "name": row["brawler_name"],
+            "power": row["brawler_power"],
+            "trophies": row["brawler_trophies"]
+        }
+        # Only add trophyChange if it's explicitly stored
+        if row["trophy_change"] is not None:
+            brawler_obj["trophyChange"] = row["trophy_change"]
+
+        # Handle player/team grouping
+        if p_tag not in m["_players_temp"]:
+            player_obj = {
+                "tag": "#" + p_tag,
+                "name": row["p_name"] or "Unknown"
+            }
+            
+            if mode == "duels":
+                player_obj["brawlers"] = [brawler_obj]
+            else:
+                player_obj["brawler"] = brawler_obj
+            
+            m["_players_temp"][p_tag] = player_obj
+            
+            # Place player in correct structural location
+            if mode == "soloshowdown" or mode == "duels":
+                m["battle"]["players"].append(player_obj)
+            else:
+                # 3v3 and Duo Showdown use teams
+                team_id = row["team_id"] or 0
+                while len(m["battle"]["teams"]) <= team_id:
+                    m["battle"]["teams"].append([])
+                m["battle"]["teams"][team_id].append(player_obj)
+        elif mode == "duels":
+            # Add additional brawlers for Duels
+            m["_players_temp"][p_tag]["brawlers"].append(brawler_obj)
+
+    # 3. Finalize and clean up
+    items = []
+    for mid in matches_map:
+        m = matches_map[mid]
+        
+        # Post-process starPlayer
+        if "starPlayer" in m["battle"]:
+            star_tag = m["battle"]["starPlayer"]["tag"].replace("#", "")
+            if star_tag in m["_players_temp"]:
+                sp = m["_players_temp"][star_tag]
+                m["battle"]["starPlayer"] = {
+                    "tag": sp["tag"],
+                    "name": sp["name"],
+                    "brawler": sp.get("brawler") or (sp.get("brawlers")[0] if sp.get("brawlers") else None)
+                }
+
+        del m["_players_temp"]
+        items.append(m)
 
     conn.close()
     items.sort(key=lambda x: x["battleTime"], reverse=True)

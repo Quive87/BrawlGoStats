@@ -306,8 +306,7 @@ func processSnowball(data BattleLogResponse, out chan<- Payload) {
 				// Base Match Info
 				starPlayerTag := strings.TrimPrefix(item.Battle.StarPlayer.Tag, "#")
 				starPlayerTag = strings.ToUpper(starPlayerTag)
-				// match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id, mode_id, raw_data
-				out <- Payload{Match: []any{matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Event.ID, item.Battle.Duration, starPlayerTag, item.Event.ID, 0, nil}}
+				out <- Payload{Match: []any{matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Event.ID, item.Battle.Duration, starPlayerTag, item.Event.ID}}
 				out <- Payload{Upsert: []any{cleanTag, p.Name}}
 
 				// Handle Multiple Brawlers (Duels)
@@ -375,7 +374,7 @@ func flushBatch(db *sql.DB, batch []Payload) {
 		return
 	}
 
-	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id, mode_id, raw_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, skin_id, is_winner, team_id, trophy_change, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	stmtUpsert, _ := tx.Prepare(`
 		INSERT INTO players (tag, name) 

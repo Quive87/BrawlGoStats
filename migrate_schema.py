@@ -6,23 +6,81 @@ if not os.path.exists(DB_NAME):
     DB_NAME = "brawl_data.sqlite"
 
 def migrate():
-    if not os.path.exists(DB_NAME):
-        print(f"Error: {DB_NAME} not found.")
-        return
+    # Ensure directory exists
+    db_dir = os.path.dirname(DB_NAME)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
 
     conn = sqlite3.connect(DB_NAME, timeout=30)
     cursor = conn.cursor()
 
-    print(f"Starting migration for {DB_NAME}...")
+    print(f"Starting migration/initialization for {DB_NAME}...")
+
+    # --- Initial Table Creation (for fresh deployments) ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            tag TEXT PRIMARY KEY,
+            discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            profile_updated_at TIMESTAMP,
+            is_processed INTEGER DEFAULT 0,
+            has_scanned_club INTEGER DEFAULT 0,
+            name TEXT,
+            icon_id INTEGER,
+            trophies INTEGER,
+            highest_trophies INTEGER,
+            total_prestige_level INTEGER,
+            exp_level INTEGER,
+            exp_points INTEGER,
+            is_qualified_from_championship_challenge INTEGER,
+            victories_3v3 INTEGER,
+            victories_solo INTEGER,
+            victories_duo INTEGER,
+            club_tag TEXT,
+            club_name TEXT,
+            brawlers_data BLOB,
+            last_battlelog_scan TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_trophies ON players(trophies);")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS matches (
+            match_id TEXT PRIMARY KEY,
+            battle_time TEXT,
+            mode TEXT,
+            type TEXT,
+            map TEXT,
+            map_id INTEGER,
+            duration INTEGER,
+            star_player_tag TEXT,
+            event_id INTEGER,
+            mode_id INTEGER
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_filter ON matches(mode, type, battle_time);")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS match_players (
+            match_id TEXT,
+            player_tag TEXT,
+            brawler_name TEXT,
+            brawler_id INTEGER,
+            brawler_power INTEGER,
+            brawler_trophies INTEGER,
+            skin_name TEXT,
+            skin_id INTEGER,
+            is_winner INTEGER DEFAULT 0,
+            team_id INTEGER,
+            trophy_change INTEGER,
+            result TEXT,
+            PRIMARY KEY (match_id, player_tag, brawler_id)
+        )
+    """)
 
     try:
         # Add event_id to matches
-        print("Adding 'event_id' and 'raw_data' to 'matches'...")
+        print("Adding 'event_id' to 'matches'...")
         cursor.execute("ALTER TABLE matches ADD COLUMN event_id INTEGER;")
-    except sqlite3.OperationalError: pass # Already exists
-
-    try:
-        cursor.execute("ALTER TABLE matches ADD COLUMN raw_data BLOB;")
     except sqlite3.OperationalError: pass # Already exists
 
     try:

@@ -74,8 +74,7 @@ def setup_db():
             duration INTEGER,
             star_player_tag TEXT,
             event_id INTEGER,
-            mode_id INTEGER,
-            raw_data BLOB
+            mode_id INTEGER
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_filter ON matches(mode, type, battle_time);")
@@ -104,7 +103,6 @@ def setup_db():
         "ALTER TABLE match_players ADD COLUMN skin_id INTEGER",
         "ALTER TABLE matches ADD COLUMN event_id INTEGER",
         "ALTER TABLE matches ADD COLUMN mode_id INTEGER",
-        "ALTER TABLE matches ADD COLUMN raw_data BLOB",
         "ALTER TABLE players ADD COLUMN last_battlelog_scan TIMESTAMP",
     ):
         try:
@@ -360,8 +358,8 @@ async def db_writer():
             # 6. Process matches
             if "match" in grouped_ops:
                 cursor.executemany("""
-                    INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id, mode_id, raw_data)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id, mode_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, grouped_ops["match"])
 
             # 7. Process match_players
@@ -369,8 +367,8 @@ async def db_writer():
                 cursor.executemany("""
                     INSERT OR IGNORE INTO match_players (
                         match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies,
-                        is_winner, team_id, trophy_change, result, skin_name, skin_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        is_winner, team_id, trophy_change, result
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, grouped_ops["match_player"])
 
             # 8. Process scan_done
@@ -467,17 +465,12 @@ async def queue_battlelog_data(tag, log_data):
         tags_hash = hashlib.sha256(f"{match_id_base}|{map_id or map_name}|{','.join(all_tags)}".encode()).hexdigest()
         match_id = f"{match_id_base}-{tags_hash[:16]}"
 
-        # Store full battle item JSON for extended battlelog format
-        raw_json = json.dumps(item)
-        compressed_raw = compress_data(raw_json)
-
-        await db_queue.put(("match", (match_id, match_id_base, mode, item["battle"].get("type"), map_name, map_id, duration, star_tag, map_id, mode_id, compressed_raw)))
+        await db_queue.put(("match", (match_id, match_id_base, mode, item["battle"].get("type"), map_name, map_id, duration, star_tag, map_id, mode_id)))
 
         for p in players_to_process:
             for b in p["brawlers"]:
                 if not b: continue
-                # Skins are NOT in battlelogs (confirmed)
-                await db_queue.put(("match_player", (match_id, p["tag"], b.get("name"), b.get("id"), b.get("power"), b.get("trophies"), p["is_winner"], p["team_id"], p["trophy_change"], p["result"], "", 0)))
+                await db_queue.put(("match_player", (match_id, p["tag"], b.get("name"), b.get("id"), b.get("power"), b.get("trophies"), p["is_winner"], p["team_id"], p["trophy_change"], p["result"])))
 
 async def worker_task(session):
     while True:
