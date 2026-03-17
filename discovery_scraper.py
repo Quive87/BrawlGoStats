@@ -237,14 +237,38 @@ async def fetch_battlelog(session, tag):
         pass
     return None
 
+# --- Rate Limiter ---
+class AsyncTokenBucket:
+    def __init__(self, rps):
+        self.rps = rps
+        self.tokens = rps
+        self.last_refill = time.time()
+        self._lock = asyncio.Lock()
+
+    async def get_token(self):
+        while True:
+            async with self._lock:
+                now = time.time()
+                elapsed = now - self.last_refill
+                self.tokens = min(self.rps, self.tokens + elapsed * self.rps)
+                self.last_refill = now
+
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+            await asyncio.sleep(0.01)
+
+# Target 70 RPS (Safe side of 75-80 RPS limit)
+rate_limiter = AsyncTokenBucket(70)
+
 # --- Globals ---
 seen_clubs = set()
-import random
 
 # --- Metrics ---
 stats_lock = asyncio.Lock()
 metrics = {
     "req_total": 0,
+    "profiles_enriched": 0,
     "429_hits": 0,
     "errors": 0,
     "start_time": time.time()
@@ -253,11 +277,13 @@ metrics = {
 async def update_metrics(m_type):
     async with stats_lock:
         if m_type == "req": metrics["req_total"] += 1
+        elif m_type == "profile": metrics["profiles_enriched"] += 1
         elif m_type == "429": metrics["429_hits"] += 1
         elif m_type == "error": metrics["errors"] += 1
 
 async def reporter_loop():
     last_req = 0
+    last_enriched = 0
     while True:
         await asyncio.sleep(5)
         cursor = conn.cursor()
@@ -271,16 +297,21 @@ async def reporter_loop():
         total_m = cursor.fetchone()[0]
         
         enrich_pct = (enriched_p / total_p * 100) if total_p > 0 else 0
+        
         curr_req = metrics["req_total"]
-        rate = (curr_req - last_req) / 5
+        curr_enriched = metrics["profiles_enriched"]
+        
+        req_rate = (curr_req - last_req) / 5
+        enrich_rate = (curr_enriched - last_enriched) / 5
+        
         last_req = curr_req
+        last_enriched = curr_enriched
         
-        # Limit is 100 req/s (1000/10s)
-        headroom = max(0, 100 - rate)
-        
-        print(f"[PY NET {rate:4.1f} req/s] Headroom: {headroom:4.1f} | Enriched: {enriched_p}/{total_p} ({enrich_pct:2.1f}%) | Matches: {total_m:<7} | Q: {task_queue.qsize()} DB: {db_queue.qsize()}")
+        print(f"[NET {req_rate:4.1f} req/s] Profiles: {enrich_rate:4.1f}/s | Total: {enriched_p}/{total_p} ({enrich_pct:2.1f}%) | M: {total_m} | EQ: {enrichment_queue.qsize()} DQ: {discovery_queue.qsize()}")
 
-# --- Database Writer ---
+# --- High-Speed Infrastructure ---
+enrichment_queue = asyncio.Queue(maxsize=30000)
+discovery_queue = asyncio.Queue(maxsize=10000)
 db_queue = asyncio.Queue(maxsize=50000)
 
 async def db_writer():
@@ -474,52 +505,78 @@ async def queue_battlelog_data(tag, log_data):
 
 async def worker_task(session):
     while True:
-        tag = await task_queue.get()
+        # 1. Get Task with Priority (Enrichment > Discovery)
+        is_priority = True
         try:
-            # 1. Profile Enrichment
-            p_res = await fetch_profile(session, tag)
-            await update_metrics("req")
-            
-            if p_res[2] == 200:
-                club_tag = await queue_profile_data(tag, p_res[1])
-                # Club Snowballing
-                if club_tag and club_tag not in seen_clubs:
-                    c_url = f"{BASE_URL}/clubs/%23{club_tag}/members"
-                    async with session.get(c_url, headers=HEADERS) as res:
-                        if res.status == 200:
-                            c_data = await res.json()
-                            m_tags = [m["tag"] for m in c_data.get("items", [])]
-                            push_tags_batch(m_tags)
-                            seen_clubs.add(club_tag)
-            elif p_res[2] == 429:
-                await update_metrics("429")
-                # Per-worker jitter backoff
-                await asyncio.sleep(random.uniform(1, 3))
-                await task_queue.put(tag) # re-queue
+            tag = enrichment_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            try:
+                tag = discovery_queue.get_nowait()
+                is_priority = False
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.1)
                 continue
-            elif p_res[2] == 404:
-                await db_queue.put(("status_404", tag))
 
-            # 2. Battlelog Discovery
-            b_res = await fetch_battlelog(session, tag)
-            await update_metrics("req")
-            if b_res:
-                await queue_battlelog_data(tag, b_res)
-                await db_queue.put(("scan_done", tag))
+        try:
+            if is_priority:
+                # PROFILE ENRICHMENT
+                await rate_limiter.get_token()
+                p_res = await fetch_profile(session, tag)
+                await update_metrics("req")
                 
-        except Exception as e:
+                if p_res[2] == 200:
+                    club_tag = await queue_profile_data(tag, p_res[1])
+                    await update_metrics("profile")
+                    # Club Snowballing
+                    if club_tag and club_tag not in seen_clubs:
+                        await rate_limiter.get_token()
+                        c_url = f"{BASE_URL}/clubs/%23{club_tag}/members"
+                        async with session.get(c_url, headers=HEADERS) as res:
+                            if res.status == 200:
+                                c_data = await res.json()
+                                m_tags = [m["tag"] for m in c_data.get("items", [])]
+                                push_tags_batch(m_tags)
+                                seen_clubs.add(club_tag)
+                                await update_metrics("req")
+                elif p_res[2] == 429:
+                    await update_metrics("429")
+                    await asyncio.sleep(1) # Extra safety sleep on 429
+                    await enrichment_queue.put(tag)
+                    continue
+                elif p_res[2] == 404:
+                    await db_queue.put(("status_404", tag))
+            else:
+                # BATTLELOG DISCOVERY
+                await rate_limiter.get_token()
+                b_res = await fetch_battlelog(session, tag)
+                await update_metrics("req")
+                if b_res:
+                    await queue_battlelog_data(tag, b_res)
+                    await db_queue.put(("scan_done", tag))
+                
+        except Exception:
             await update_metrics("error")
         finally:
-            task_queue.task_done()
+            if is_priority: enrichment_queue.task_done()
+            else: discovery_queue.task_done()
 
-# --- High-Speed Infrastructure ---
-task_queue = asyncio.Queue(maxsize=25000)
+# --- SQLite Performance Tuning ---
+def tune_db(conn):
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+    cursor.execute("PRAGMA cache_size=-64000;") # 64MB cache
+    cursor.execute("PRAGMA temp_store=MEMORY;")
+    cursor.execute("PRAGMA journal_size_limit=67108864;") # 64MB WAL limit
+
+tune_db(conn)
 
 async def main_loop_antigravity():
-    print("--- [ANTIGRAVITY] BrawlGo Engine v2.0 Started ---")
+    print("--- [ANTIGRAVITY] BrawlGo Enrichment Engine v2.0 Started ---")
     
-    num_workers = 500 
-    connector = aiohttp.TCPConnector(limit=num_workers, ttl_dns_cache=300)
+    # We can use more workers now because the Rate Limiter handles the pacing
+    num_workers = 800 
+    connector = aiohttp.TCPConnector(limit=num_workers, ttl_dns_cache=600)
     
     async with aiohttp.ClientSession(connector=connector) as session:
         await seed_if_empty(session)
@@ -528,28 +585,30 @@ async def main_loop_antigravity():
             asyncio.create_task(worker_task(session))
         
         while True:
-            if task_queue.qsize() < 1000:
+            # 1. Fill Enrichment Queue (Priority)
+            if enrichment_queue.qsize() < 5000:
                 cursor = conn.cursor()
-                
-                # Priority 1: Never-enriched players
                 cursor.execute("SELECT tag FROM players WHERE profile_updated_at IS NULL LIMIT 10000")
                 seeds = cursor.fetchall()
-                
-                # Priority 2: Stale profiles (backfill)
-                if len(seeds) < 500:
-                    cursor.execute("SELECT tag FROM players WHERE profile_updated_at < datetime('now', '-3 days') LIMIT 10000")
-                    seeds += cursor.fetchall()
-
-                if not seeds:
-                    print("All caught up! Idling 30s...")
-                    await asyncio.sleep(30)
-                    continue
-
                 for (tag,) in seeds:
-                    try: task_queue.put_nowait(tag)
+                    try: enrichment_queue.put_nowait(tag)
                     except asyncio.QueueFull: break
-                
-                print(f"Fed {len(seeds)} tags to engine. Q-Limit: 25k")
+                if seeds: print(f"Fed {len(seeds)} tags to Enrichment Queue.")
+
+            # 2. Fill Discovery Queue (Secondary)
+            if enrichment_queue.qsize() < 1000 and discovery_queue.qsize() < 2000:
+                cursor = conn.cursor()
+                # Stale profiles or ones that haven't been scanned for logs recently
+                cursor.execute("""
+                    SELECT tag FROM players 
+                    WHERE profile_updated_at IS NOT NULL 
+                    AND (last_battlelog_scan IS NULL OR last_battlelog_scan < datetime('now', '-1 day'))
+                    LIMIT 5000
+                """)
+                seeds = cursor.fetchall()
+                for (tag,) in seeds:
+                    try: discovery_queue.put_nowait(tag)
+                    except asyncio.QueueFull: break
             
             await asyncio.sleep(5)
 
