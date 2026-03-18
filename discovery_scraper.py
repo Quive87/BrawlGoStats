@@ -62,6 +62,8 @@ def setup_db():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_trophies ON players(trophies);")
+    # Partial index for ultra-fast enrichment priority
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_unenriched ON players(tag) WHERE profile_updated_at IS NULL;")
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS matches (
@@ -135,6 +137,14 @@ def setup_db():
             item_name TEXT,
             equip_count INTEGER DEFAULT 1,
             PRIMARY KEY (brawler_id, item_id)
+        )
+    """)
+    # Brawler Ownership Stats Table (used for Ownership Rate = item_count / player_count)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS brawler_stats (
+            brawler_id INTEGER PRIMARY KEY,
+            brawler_name TEXT,
+            player_count INTEGER DEFAULT 0
         )
     """)
 
@@ -219,13 +229,11 @@ async def fetch_profile(session, tag):
 
 def push_tags_batch(tags):
     if not tags: return
-    formatted = [(t.replace("#", ""),) for t in tags]
-    try:
-        cursor = conn.cursor()
-        cursor.executemany("INSERT OR IGNORE INTO players (tag) VALUES (?)", formatted)
-        conn.commit()
-    except Exception as e:
-        print(f"DB Error: {e}")
+    for t in tags:
+        try:
+            db_queue.put_nowait(("new_tag", t.replace("#", "").upper()))
+        except:
+            pass
 
 async def fetch_battlelog(session, tag):
     url = f"{BASE_URL}/players/%23{tag}/battlelog"
@@ -246,17 +254,24 @@ class AsyncTokenBucket:
         self._lock = asyncio.Lock()
 
     async def get_token(self):
-        while True:
-            async with self._lock:
+        async with self._lock:
+            while self.tokens < 1:
                 now = time.time()
                 elapsed = now - self.last_refill
                 self.tokens = min(self.rps, self.tokens + elapsed * self.rps)
                 self.last_refill = now
-
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return
-            await asyncio.sleep(0.01)
+                
+                if self.tokens < 1:
+                    # Calculate sleep time to reach next token
+                    sleep_time = (1 - self.tokens) / self.rps
+                    await asyncio.sleep(sleep_time)
+            
+            self.tokens -= 1
+            # Refill logic after sleep
+            now = time.time()
+            elapsed = now - self.last_refill
+            self.tokens = min(self.rps, self.tokens + elapsed * self.rps)
+            self.last_refill = now
 
 # Target 70 RPS (Safe side of 75-80 RPS limit)
 rate_limiter = AsyncTokenBucket(70)
@@ -310,13 +325,13 @@ async def reporter_loop():
         print(f"[NET {req_rate:4.1f} req/s] Profiles: {enrich_rate:4.1f}/s | Total: {enriched_p}/{total_p} ({enrich_pct:2.1f}%) | M: {total_m} | EQ: {enrichment_queue.qsize()} DQ: {discovery_queue.qsize()}")
 
 # --- High-Speed Infrastructure ---
-enrichment_queue = asyncio.Queue(maxsize=30000)
+enrichment_queue = asyncio.Queue(maxsize=15000)
 discovery_queue = asyncio.Queue(maxsize=10000)
-db_queue = asyncio.Queue(maxsize=50000)
+db_queue = asyncio.Queue(maxsize=30000)
 
 async def db_writer():
     print("--- DB Writer Started ---")
-    batch_size = 5000
+    batch_size = 1000
     while True:
         ops = []
         try:
@@ -343,19 +358,11 @@ async def db_writer():
                 tags = [(d[1],) for d in grouped_ops["match_player"]]
                 cursor.executemany("INSERT OR IGNORE INTO players (tag) VALUES (?)", tags)
 
-            # 2. Process Profiles
+            # 2. Process Profiles (Optimized for 30M scale)
             if "profile" in grouped_ops:
-                for data in grouped_ops["profile"]:
-                    tag, p_data, compressed_brawlers, club_tag, club_name = data
-                    cursor.execute("""
-                        UPDATE players 
-                        SET profile_updated_at = CURRENT_TIMESTAMP, is_processed = 1,
-                            name = ?, icon_id = ?, trophies = ?, highest_trophies = ?, total_prestige_level = ?,
-                            exp_level = ?, exp_points = ?, is_qualified_from_championship_challenge = ?,
-                            victories_3v3 = ?, victories_solo = ?, victories_duo = ?,
-                            club_tag = ?, club_name = ?, brawlers_data = ?
-                        WHERE tag = ?
-                    """, (
+                profile_params = []
+                for tag, p_data, compressed_brawlers, club_tag, club_name in grouped_ops["profile"]:
+                    profile_params.append((
                         p_data.get("name", ""), p_data.get("icon", {}).get("id", None),
                         p_data.get("trophies", 0), p_data.get("highestTrophies", 0),
                         p_data.get("totalPrestigeLevel", 0), p_data.get("expLevel", 0),
@@ -363,6 +370,16 @@ async def db_writer():
                         p_data.get("3vs3Victories", 0), p_data.get("soloVictories", 0), p_data.get("duoVictories", 0),
                         club_tag, club_name, compressed_brawlers, tag
                     ))
+                
+                cursor.executemany("""
+                    UPDATE players 
+                    SET profile_updated_at = CURRENT_TIMESTAMP, is_processed = 1,
+                        name = ?, icon_id = ?, trophies = ?, highest_trophies = ?, total_prestige_level = ?,
+                        exp_level = ?, exp_points = ?, is_qualified_from_championship_challenge = ?,
+                        victories_3v3 = ?, victories_solo = ?, victories_duo = ?,
+                        club_tag = ?, club_name = ?, brawlers_data = ?
+                    WHERE tag = ?
+                """, profile_params)
 
             # 3. Process Brawlers
             if "brawler" in grouped_ops:
@@ -407,6 +424,21 @@ async def db_writer():
                 tags = [(t,) for t in grouped_ops["scan_done"]]
                 cursor.executemany("UPDATE players SET last_battlelog_scan = CURRENT_TIMESTAMP WHERE tag = ?", tags)
 
+            # 9. Process new_tags (Non-blocking discovery)
+            if "new_tag" in grouped_ops:
+                tags = [(t,) for t in grouped_ops["new_tag"]]
+                cursor.executemany("INSERT OR IGNORE INTO players (tag) VALUES (?)", tags)
+
+            # 10. Process brawler_stat (Ownership Rate denominator)
+            if "brawler_stat" in grouped_ops:
+                cursor.executemany("""
+                    INSERT INTO brawler_stats (brawler_id, brawler_name, player_count)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(brawler_id) DO UPDATE SET
+                        player_count = player_count + 1,
+                        brawler_name = excluded.brawler_name
+                """, grouped_ops["brawler_stat"])
+
             conn.commit()
             for _ in ops: db_queue.task_done()
         except Exception as e:
@@ -429,8 +461,12 @@ async def queue_profile_data(tag, p_data):
 
     for brawler in p_data.get("brawlers", []):
         b_id = brawler["id"]
+        b_name = brawler.get("name", "")
         skin = brawler.get("skin") or {}
-        await db_queue.put(("brawler", (tag, b_id, brawler.get("name"), brawler.get("trophies"), skin.get("id"), skin.get("name"))))
+        await db_queue.put(("brawler", (tag, b_id, b_name, brawler.get("trophies"), skin.get("id"), skin.get("name"))))
+        
+        # Increment brawler ownership counter for accurate Ownership Rate calculation
+        await db_queue.put(("brawler_stat", (b_id, b_name)))
 
         for key, item_type in [("gadgets", "gadget"), ("starPowers", "starpower"), ("gears", "gear"), ("hyperCharges", "hypercharge")]:
             for item in brawler.get(key, []):
@@ -537,6 +573,9 @@ async def worker_task(session):
                                 m_tags = [m["tag"] for m in c_data.get("items", [])]
                                 push_tags_batch(m_tags)
                                 seen_clubs.add(club_tag)
+                                # Cap seen_clubs to prevent memory leak (Memory-efficient rotation)
+                                if len(seen_clubs) > 50000:
+                                    seen_clubs.clear() 
                                 await update_metrics("req")
                 elif p_res[2] == 429:
                     await update_metrics("429")
@@ -574,8 +613,8 @@ tune_db(conn)
 async def main_loop_antigravity():
     print("--- [ANTIGRAVITY] BrawlGo Enrichment Engine v2.0 Started ---")
     
-    # We can use more workers now because the Rate Limiter handles the pacing
-    num_workers = 800 
+    # 200 workers is the "sweet spot" (Fast but efficient)
+    num_workers = 200 
     connector = aiohttp.TCPConnector(limit=num_workers, ttl_dns_cache=600)
     
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -612,6 +651,184 @@ async def main_loop_antigravity():
             
             await asyncio.sleep(5)
 
+async def aggregator_loop():
+    """Background task: refreshes all pre-aggregation tables every 60 seconds.
+    This ensures API reads are always instant O(1) SELECTs on small summary tables."""
+    print("--- Aggregator Loop Started ---")
+    synergy_cycle = 0  # Run synergy/matchups every 10 min (expensive)
+    while True:
+        try:
+            c = conn.cursor()
+
+            # 1. Brawler meta (pick counts)
+            c.execute("DELETE FROM agg_brawler_meta")
+            c.execute("""
+                INSERT INTO agg_brawler_meta (brawler_id, brawler_name, mode, map, match_type, pick_count, avg_trophies)
+                SELECT mp.brawler_id, mp.brawler_name,
+                       COALESCE(m.mode, ''), COALESCE(m.map, ''), COALESCE(m.type, ''),
+                       COUNT(*), AVG(mp.brawler_trophies)
+                FROM match_players mp
+                JOIN matches m ON mp.match_id = m.match_id
+                GROUP BY mp.brawler_id, m.mode, m.map, m.type
+            """)
+
+            # 2. Win rates (last 30 days)
+            c.execute("DELETE FROM agg_winrates")
+            c.execute("""
+                INSERT INTO agg_winrates (brawler_id, brawler_name, mode, match_type, total_games, wins, win_rate)
+                SELECT mp.brawler_id, mp.brawler_name,
+                       COALESCE(m.mode, ''), COALESCE(m.type, ''),
+                       COUNT(*), SUM(mp.is_winner),
+                       ROUND(CAST(SUM(mp.is_winner) AS FLOAT) / COUNT(*) * 100, 1)
+                FROM match_players mp
+                JOIN matches m ON mp.match_id = m.match_id
+                WHERE m.battle_time > datetime('now', '-30 days')
+                GROUP BY mp.brawler_id, m.mode, m.type
+                HAVING COUNT(*) >= 50
+            """)
+
+            # 3. Mode stats
+            c.execute("DELETE FROM agg_mode_stats")
+            c.execute("""
+                INSERT INTO agg_mode_stats (mode, match_type, count)
+                SELECT mode, type, COUNT(*) FROM matches GROUP BY mode, type
+            """)
+
+            # 4. Icon stats
+            c.execute("DELETE FROM agg_icon_stats")
+            c.execute("""
+                INSERT INTO agg_icon_stats (icon_id, count)
+                SELECT icon_id, COUNT(*) FROM players
+                WHERE icon_id IS NOT NULL AND icon_id != 0
+                GROUP BY icon_id
+            """)
+
+            # 5. Daily activity (last 30 days)
+            c.execute("DELETE FROM agg_daily_activity WHERE day < date('now', '-30 days')")
+            c.execute("""
+                INSERT OR REPLACE INTO agg_daily_activity (day, match_count)
+                SELECT substr(battle_time, 1, 8), COUNT(*)
+                FROM matches
+                WHERE battle_time > datetime('now', '-30 days')
+                GROUP BY substr(battle_time, 1, 8)
+            """)
+
+            # 6. Brawler trend (last 7 days)
+            c.execute("DELETE FROM agg_brawler_trend WHERE day < date('now', '-7 days')")
+            c.execute("""
+                INSERT OR REPLACE INTO agg_brawler_trend (day, brawler_name, mode, match_type, picks)
+                SELECT substr(m.battle_time, 1, 8), mp.brawler_name,
+                       COALESCE(m.mode, ''), COALESCE(m.type, ''),
+                       COUNT(*)
+                FROM match_players mp
+                JOIN matches m ON mp.match_id = m.match_id
+                WHERE m.battle_time > datetime('now', '-7 days')
+                GROUP BY substr(m.battle_time, 1, 8), mp.brawler_name, m.mode, m.type
+            """)
+
+            conn.commit()
+
+            # 7. Synergy + Matchups run every ~10 minutes (expensive self-joins)
+            synergy_cycle += 1
+            if synergy_cycle >= 10:
+                synergy_cycle = 0
+
+                c.execute("DELETE FROM agg_synergy")
+                c.execute("""
+                    INSERT INTO agg_synergy (brawler_id, teammate_id, teammate_name, matches_played, win_rate)
+                    SELECT mp1.brawler_id, mp2.brawler_id, mp2.brawler_name,
+                           COUNT(*),
+                           ROUND(CAST(SUM(mp1.is_winner) AS FLOAT) / COUNT(*) * 100, 1)
+                    FROM match_players mp1
+                    JOIN match_players mp2 ON mp1.match_id = mp2.match_id AND mp1.team_id = mp2.team_id
+                    WHERE mp2.brawler_id != mp1.brawler_id
+                    GROUP BY mp1.brawler_id, mp2.brawler_id
+                    HAVING COUNT(*) > 50
+                """)
+
+                c.execute("DELETE FROM agg_matchups")
+                c.execute("""
+                    INSERT INTO agg_matchups (brawler_id, enemy_id, enemy_name, encounters, enemy_win_rate)
+                    SELECT mp1.brawler_id, mp2.brawler_id, mp2.brawler_name,
+                           COUNT(*),
+                           ROUND(CAST(SUM(mp2.is_winner) AS FLOAT) / COUNT(*) * 100, 1)
+                    FROM match_players mp1
+                    JOIN match_players mp2 ON mp1.match_id = mp2.match_id AND mp1.team_id != mp2.team_id
+                    GROUP BY mp1.brawler_id, mp2.brawler_id
+                    HAVING COUNT(*) > 50
+                """)
+
+                # Skin popularity
+                c.execute("DELETE FROM agg_skins")
+                c.execute("""
+                    INSERT INTO agg_skins (brawler_id, brawler_name, skin_id, skin_name, count)
+                    SELECT brawler_id, brawler_name,
+                           COALESCE(skin_id, 0), COALESCE(skin_name, ''),
+                           COUNT(*)
+                    FROM match_players
+                    WHERE (skin_id IS NOT NULL AND skin_id != 0)
+                       OR (skin_name IS NOT NULL AND skin_name != '')
+                    GROUP BY brawler_id, COALESCE(skin_id, 0), COALESCE(skin_name, '')
+                """)
+
+                # Map list
+                c.execute("DELETE FROM agg_map_list")
+                c.execute("""
+                    INSERT INTO agg_map_list (map, mode, match_count)
+                    SELECT map, mode, COUNT(*) FROM matches
+                    WHERE map IS NOT NULL
+                    GROUP BY map, mode
+                """)
+
+                # Deep map analytics (best picks + use rates per map/brawler)
+                c.execute("DELETE FROM agg_map_analytics")
+                c.execute("""
+                    INSERT INTO agg_map_analytics (map, brawler_name, total_games, wins, win_rate, use_rate)
+                    SELECT m.map, mp.brawler_name,
+                           COUNT(*),
+                           SUM(mp.is_winner),
+                           ROUND(CAST(SUM(mp.is_winner) AS FLOAT) / COUNT(*) * 100, 1),
+                           ROUND(CAST(COUNT(*) AS FLOAT) /
+                               (SELECT COUNT(*) FROM matches m2 WHERE m2.map = m.map) * 100, 1)
+                    FROM match_players mp
+                    JOIN matches m ON mp.match_id = m.match_id
+                    WHERE m.map IS NOT NULL
+                    GROUP BY m.map, mp.brawler_name
+                    HAVING COUNT(*) >= 10
+                """)
+
+                # Top team comps per map
+                c.execute("DELETE FROM agg_map_teams")
+                c.execute("""
+                    INSERT INTO agg_map_teams (map, brawlers, play_count, win_rate)
+                    WITH TeamComps AS (
+                        SELECT m.map, mp.match_id, mp.team_id, mp.is_winner,
+                               GROUP_CONCAT(mp.brawler_name, ',') as brawlers
+                        FROM (
+                            SELECT match_id, team_id, is_winner, brawler_name
+                            FROM match_players ORDER BY brawler_name
+                        ) mp
+                        JOIN matches m ON mp.match_id = m.match_id
+                        WHERE m.map IS NOT NULL
+                        GROUP BY m.map, mp.match_id, mp.team_id
+                        HAVING COUNT(*) = 3
+                    )
+                    SELECT map, brawlers, COUNT(*) as play_count,
+                           ROUND(CAST(SUM(is_winner) AS FLOAT) / COUNT(*) * 100, 1) as win_rate
+                    FROM TeamComps
+                    GROUP BY map, brawlers
+                    HAVING play_count >= 5
+                """)
+
+                conn.commit()
+                print("[Aggregator] Synergy + Matchups + Skins + Maps refreshed.")
+
+            print("[Aggregator] All agg tables refreshed.")
+        except Exception as e:
+            print(f"[Aggregator] Error: {e}")
+
+        await asyncio.sleep(60)
+
 async def main():
     if not SUPERCELL_API_TOKEN:
         print("ERROR: SUPERCELL_API_TOKEN is missing in .env")
@@ -619,6 +836,7 @@ async def main():
         
     asyncio.create_task(db_writer())
     asyncio.create_task(reporter_loop())
+    asyncio.create_task(aggregator_loop())
     await main_loop_antigravity()
 
 if __name__ == "__main__":

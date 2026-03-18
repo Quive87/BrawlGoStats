@@ -190,12 +190,213 @@ def migrate():
         print(f"Error creating brawler_build_stats table: {e}")
 
     try:
+        print("Creating 'brawler_stats' table for ownership rate calculations...")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS brawler_stats (
+                brawler_id INTEGER PRIMARY KEY,
+                brawler_name TEXT,
+                player_count INTEGER DEFAULT 0
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_brawler_stats_id ON brawler_stats(brawler_id);")
+    except Exception as e:
+        print(f"Error creating brawler_stats table: {e}")
+
+    try:
         print("Checking players index...")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_enrichment ON players(profile_updated_at);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_battlelog_scan ON players(last_battlelog_scan);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_name ON players(name);")
     except Exception as e:
         print(f"Error creating index idx_players_enrichment: {e}")
-        
+
+    try:
+        print("Creating FTS5 trigram search index (players_search)...")
+        # FTS5 trigram index allows fast substring/fuzzy matching on player names
+        cursor.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS players_search
+            USING fts5(tag UNINDEXED, name, tokenize='trigram')
+        """)
+
+        # Backfill: populate from all existing players who have a name
+        # INSERT OR IGNORE so re-running migration is safe
+        print("Backfilling players_search from existing players (may take a moment for large DBs)...")
+        cursor.execute("""
+            INSERT OR IGNORE INTO players_search (tag, name)
+            SELECT tag, name FROM players
+            WHERE name IS NOT NULL AND name != ''
+        """)
+        backfill_count = cursor.rowcount
+        print(f"Backfilled {backfill_count} players into search index.")
+
+        # Trigger: keep FTS5 in sync when a player's name is inserted
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_players_search_insert
+            AFTER INSERT ON players
+            WHEN NEW.name IS NOT NULL AND NEW.name != ''
+            BEGIN
+                INSERT OR REPLACE INTO players_search(tag, name) VALUES (NEW.tag, NEW.name);
+            END
+        """)
+
+        # Trigger: keep FTS5 in sync when a player's name is updated
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_players_search_update
+            AFTER UPDATE OF name ON players
+            WHEN NEW.name IS NOT NULL AND NEW.name != ''
+            BEGIN
+                INSERT OR REPLACE INTO players_search(tag, name) VALUES (NEW.tag, NEW.name);
+            END
+        """)
+
+        print("players_search FTS5 index ready.")
+    except Exception as e:
+        print(f"Error creating players_search FTS5 index: {e}")
+
+    # --- Pre-aggregation Tables (materialized views refreshed by aggregator_loop) ---
+    try:
+        print("Creating pre-aggregation tables...")
+
+        # Brawler pick counts + avg stat (for /meta/brawlers)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_brawler_meta (
+                brawler_id   INTEGER,
+                brawler_name TEXT,
+                mode         TEXT,
+                map          TEXT,
+                match_type   TEXT,
+                pick_count   INTEGER DEFAULT 0,
+                avg_trophies REAL DEFAULT 0,
+                PRIMARY KEY (brawler_id, mode, map, match_type)
+            )
+        """)
+
+        # Win rates per brawler (for /meta/brawlers/winrate)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_winrates (
+                brawler_id   INTEGER,
+                brawler_name TEXT,
+                mode         TEXT,
+                match_type   TEXT,
+                total_games  INTEGER DEFAULT 0,
+                wins         INTEGER DEFAULT 0,
+                win_rate     REAL DEFAULT 0,
+                PRIMARY KEY (brawler_id, mode, match_type)
+            )
+        """)
+
+        # Mode popularity (for /meta/modes)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_mode_stats (
+                mode       TEXT,
+                match_type TEXT,
+                count      INTEGER DEFAULT 0,
+                PRIMARY KEY (mode, match_type)
+            )
+        """)
+
+        # Icon popularity (for /meta/icons)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_icon_stats (
+                icon_id INTEGER PRIMARY KEY,
+                count   INTEGER DEFAULT 0
+            )
+        """)
+
+        # Daily activity (for /activity/daily)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_daily_activity (
+                day         TEXT PRIMARY KEY,
+                match_count INTEGER DEFAULT 0
+            )
+        """)
+
+        # Brawler synergy (for /meta/synergy/{id})
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_synergy (
+                brawler_id    INTEGER,
+                teammate_id   INTEGER,
+                teammate_name TEXT,
+                matches_played INTEGER DEFAULT 0,
+                win_rate      REAL DEFAULT 0,
+                PRIMARY KEY (brawler_id, teammate_id)
+            )
+        """)
+
+        # Brawler matchups / counters (for /meta/matchups/{id})
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_matchups (
+                brawler_id    INTEGER,
+                enemy_id      INTEGER,
+                enemy_name    TEXT,
+                encounters    INTEGER DEFAULT 0,
+                enemy_win_rate REAL DEFAULT 0,
+                PRIMARY KEY (brawler_id, enemy_id)
+            )
+        """)
+
+        # Brawler trend daily (for /meta/brawlers/trend)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_brawler_trend (
+                day          TEXT,
+                brawler_name TEXT,
+                mode         TEXT,
+                match_type   TEXT,
+                picks        INTEGER DEFAULT 0,
+                PRIMARY KEY (day, brawler_name, mode, match_type)
+            )
+        """)
+
+        # Skin popularity (for /meta/skins)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_skins (
+                brawler_id   INTEGER,
+                brawler_name TEXT,
+                skin_id      INTEGER,
+                skin_name    TEXT,
+                count        INTEGER DEFAULT 0,
+                PRIMARY KEY (brawler_id, skin_id, skin_name)
+            )
+        """)
+
+        # Map list (for /meta/maps/list)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_map_list (
+                map         TEXT,
+                mode        TEXT,
+                match_count INTEGER DEFAULT 0,
+                PRIMARY KEY (map, mode)
+            )
+        """)
+
+        # Deep map analytics (for /meta/maps) — best picks and most used per map per brawler
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_map_analytics (
+                map          TEXT,
+                brawler_name TEXT,
+                total_games  INTEGER DEFAULT 0,
+                wins         INTEGER DEFAULT 0,
+                win_rate     REAL DEFAULT 0,
+                use_rate     REAL DEFAULT 0,
+                PRIMARY KEY (map, brawler_name)
+            )
+        """)
+
+        # Top team comps per map (for /meta/maps top teams section)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_map_teams (
+                map         TEXT,
+                brawlers    TEXT,
+                play_count  INTEGER DEFAULT 0,
+                win_rate    REAL DEFAULT 0,
+                PRIMARY KEY (map, brawlers)
+            )
+        """)
+
+        print("Pre-aggregation tables created.")
+    except Exception as e:
+        print(f"Error creating pre-aggregation tables: {e}")
+
     conn.commit()
     conn.close()
     print("Migration completed successfully!")
