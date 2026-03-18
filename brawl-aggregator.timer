@@ -1,0 +1,11 @@
+[Unit]
+Description=BrawlGo Pre-aggregation Timer (every 2 minutes)
+After=brawl-discovery.service
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=2min
+Unit=brawl-aggregator.service
+
+[Install]
+WantedBy=timers.target

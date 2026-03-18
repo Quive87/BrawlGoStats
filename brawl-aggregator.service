@@ -1,0 +1,11 @@
+[Unit]
+Description=BrawlGo Pre-aggregation Job
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/var/www/BrawlGoStats
+ExecStart=/var/www/BrawlGoStats/venv/bin/python3 /var/www/BrawlGoStats/aggregator.py
+StandardOutput=journal
+StandardError=journal

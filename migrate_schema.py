@@ -203,6 +203,24 @@ def migrate():
         print(f"Error creating brawler_stats table: {e}")
 
     try:
+        # FREE UP MASSIVE DISK SPACE: NULL out brawlers_data BLOBs.
+        # This data is fully captured in player_brawlers + brawler_build_stats.
+        # Only run if there are rows with non-null blobs to avoid pointless lock.
+        blob_count = cursor.execute(
+            "SELECT COUNT(*) FROM players WHERE brawlers_data IS NOT NULL"
+        ).fetchone()[0]
+        if blob_count > 0:
+            print(f"Freeing brawlers_data BLOBs from {blob_count} rows (this may take a minute)...")
+            cursor.execute("UPDATE players SET brawlers_data = NULL WHERE brawlers_data IS NOT NULL")
+            conn.commit()
+            print("BLOBs cleared. Run 'sqlite3 brawl_data.sqlite VACUUM;' on the VPS to reclaim disk space.")
+        else:
+            print("brawlers_data already cleared — skipping.")
+    except Exception as e:
+        print(f"Error clearing brawlers_data: {e}")
+
+
+    try:
         print("Checking players index...")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_enrichment ON players(profile_updated_at);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_battlelog_scan ON players(last_battlelog_scan);")

@@ -312,13 +312,13 @@ async def reporter_loop():
         print(f"[NET {req_rate:4.1f} req/s] Enriched: {enrich_rate:4.1f}/s | Session total: {curr_enriched} | EQ: {enrichment_queue.qsize()} DQ: {discovery_queue.qsize()}")
 
 # --- High-Speed Infrastructure ---
-enrichment_queue = asyncio.Queue(maxsize=15000)
-discovery_queue = asyncio.Queue(maxsize=10000)
-db_queue = asyncio.Queue(maxsize=30000)
+enrichment_queue = asyncio.Queue(maxsize=5000)
+discovery_queue = asyncio.Queue(maxsize=5000)
+db_queue = asyncio.Queue(maxsize=10000)
 
 async def db_writer():
     print("--- DB Writer Started ---")
-    batch_size = 1000
+    batch_size = 500
     while True:
         ops = []
         try:
@@ -839,11 +839,14 @@ async def main():
     if not SUPERCELL_API_TOKEN:
         print("ERROR: SUPERCELL_API_TOKEN is missing in .env")
         return
-        
+
     asyncio.create_task(db_writer())
     asyncio.create_task(reporter_loop())
-    asyncio.create_task(aggregator_loop())
     await main_loop_antigravity()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
