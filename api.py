@@ -49,13 +49,13 @@ cache_1h = TTLCache(maxsize=100, ttl=3600)
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
-    # High-Performance Optimization PRAGMAs for 40GB+ Scale
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA mmap_size = 30000000000") # 30GB Memory Map for fast reads
-    conn.execute("PRAGMA cache_size = -2000000")    # 2GB Cache
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA mmap_size=2000000000")   # 2GB mmap
+    conn.execute("PRAGMA cache_size=-65536")       # 64MB page cache
+    conn.execute("PRAGMA temp_store=MEMORY")
     return conn
 
 def decompress_brawlers(compressed_data):
