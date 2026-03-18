@@ -71,27 +71,23 @@ def decompress_brawlers(compressed_data):
 cache_1m = TTLCache(maxsize=10, ttl=60)
 
 @app.get("/health", summary="System Health & Storage Monitor")
-@cached(cache_1m)
 def health_check():
-    """System health monitoring: checks DB size, worker progress, and disk availability."""
+    """Instant health check. Reads pre-computed stats from agg_stats — no table scans."""
     conn = get_db()
     try:
-        # DB Statistics
         db_size_bytes = os.path.getsize(DB_PATH)
         db_size_gb = round(db_size_bytes / (1024**3), 2)
-        
-        # Worker progress
-        stats = conn.execute("""
-            SELECT 
-                (SELECT COUNT(*) FROM players) as total_players,
-                (SELECT COUNT(*) FROM players WHERE profile_updated_at IS NOT NULL) as enriched_players,
-                (SELECT COUNT(*) FROM matches) as total_matches
-        """).fetchone()
-        
-        # Disk health (prevent overflow on 40GB project)
+
+        # Read pre-computed stats (O(1) key lookups updated every 60s by aggregator)
+        rows = conn.execute("SELECT key, value FROM agg_stats").fetchall()
+        stats = {r["key"]: r["value"] for r in rows}
+        total_players   = stats.get("total_players", 0)
+        enriched_players = stats.get("enriched_players", 0)
+        total_matches   = stats.get("total_matches", 0)
+
         total, used, free = shutil.disk_usage("/")
         free_gb = round(free / (1024**3), 2)
-        
+
         return {
             "status": "online",
             "database": {
@@ -100,14 +96,14 @@ def health_check():
                 "reachable": True
             },
             "sync_progress": {
-                "total_players": stats["total_players"],
-                "enriched_players": stats["enriched_players"],
-                "sync_rate": f"{round((stats['enriched_players'] / max(1, stats['total_players'])) * 100, 1)}%",
-                "stored_matches": stats["total_matches"]
+                "total_players": total_players,
+                "enriched_players": enriched_players,
+                "sync_rate": f"{round((enriched_players / max(1, total_players)) * 100, 1)}%",
+                "stored_matches": total_matches
             },
             "system": {
                 "free_disk_space": f"{free_gb} GB",
-                "storage_alert": free_gb < 5.0 # Warning if sub 5GB
+                "storage_alert": free_gb < 5.0
             }
         }
     except Exception as e:

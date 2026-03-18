@@ -299,30 +299,17 @@ async def update_metrics(m_type):
 async def reporter_loop():
     last_req = 0
     last_enriched = 0
+    last_print_enriched = 0
     while True:
         await asyncio.sleep(5)
-        cursor = conn.cursor()
-        
-        # Stats Queries
-        cursor.execute("SELECT COUNT(*) FROM players")
-        total_p = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM players WHERE profile_updated_at IS NOT NULL")
-        enriched_p = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM matches")
-        total_m = cursor.fetchone()[0]
-        
-        enrich_pct = (enriched_p / total_p * 100) if total_p > 0 else 0
-        
         curr_req = metrics["req_total"]
         curr_enriched = metrics["profiles_enriched"]
-        
         req_rate = (curr_req - last_req) / 5
         enrich_rate = (curr_enriched - last_enriched) / 5
-        
         last_req = curr_req
         last_enriched = curr_enriched
-        
-        print(f"[NET {req_rate:4.1f} req/s] Profiles: {enrich_rate:4.1f}/s | Total: {enriched_p}/{total_p} ({enrich_pct:2.1f}%) | M: {total_m} | EQ: {enrichment_queue.qsize()} DQ: {discovery_queue.qsize()}")
+        total_enriched = curr_enriched + last_print_enriched  # running total
+        print(f"[NET {req_rate:4.1f} req/s] Enriched: {enrich_rate:4.1f}/s | Session total: {curr_enriched} | EQ: {enrichment_queue.qsize()} DQ: {discovery_queue.qsize()}")
 
 # --- High-Speed Infrastructure ---
 enrichment_queue = asyncio.Queue(maxsize=15000)
@@ -653,12 +640,19 @@ async def main_loop_antigravity():
 
 async def aggregator_loop():
     """Background task: refreshes all pre-aggregation tables every 60 seconds.
-    This ensures API reads are always instant O(1) SELECTs on small summary tables."""
+    Uses its own dedicated SQLite connection to avoid locking the db_writer."""
     print("--- Aggregator Loop Started ---")
-    synergy_cycle = 0  # Run synergy/matchups every 10 min (expensive)
+    # Wait one cycle on startup so the scraper can warm up first
+    await asyncio.sleep(15)
+    synergy_cycle = 0  # Run synergy/matchups/skins/maps every 10 min (expensive)
     while True:
         try:
-            c = conn.cursor()
+            # Open a dedicated connection for this aggregation pass
+            agg_conn = sqlite3.connect(DB_NAME, timeout=60)
+            agg_conn.row_factory = sqlite3.Row
+            agg_conn.execute("PRAGMA journal_mode=WAL;")
+            agg_conn.execute("PRAGMA synchronous=NORMAL;")
+            c = agg_conn.cursor()
 
             # 1. Brawler meta (pick counts)
             c.execute("DELETE FROM agg_brawler_meta")
@@ -726,7 +720,16 @@ async def aggregator_loop():
                 GROUP BY substr(m.battle_time, 1, 8), mp.brawler_name, m.mode, m.type
             """)
 
-            conn.commit()
+            # 7. Health stats (agg_stats) — pre-compute DB counts for /health endpoint
+            c.execute("""
+                INSERT OR REPLACE INTO agg_stats (key, value)
+                VALUES
+                    ('total_players',    (SELECT COUNT(*) FROM players)),
+                    ('enriched_players', (SELECT COUNT(*) FROM players WHERE profile_updated_at IS NOT NULL)),
+                    ('total_matches',    (SELECT COUNT(*) FROM matches))
+            """)
+
+            agg_conn.commit()
 
             # 7. Synergy + Matchups run every ~10 minutes (expensive self-joins)
             synergy_cycle += 1
@@ -820,12 +823,15 @@ async def aggregator_loop():
                     HAVING play_count >= 5
                 """)
 
-                conn.commit()
+                agg_conn.commit()
                 print("[Aggregator] Synergy + Matchups + Skins + Maps refreshed.")
 
             print("[Aggregator] All agg tables refreshed.")
         except Exception as e:
             print(f"[Aggregator] Error: {e}")
+        finally:
+            try: agg_conn.close()
+            except: pass
 
         await asyncio.sleep(60)
 

@@ -211,6 +211,21 @@ def migrate():
         print(f"Error creating index idx_players_enrichment: {e}")
 
     try:
+        # Simple key-value stats table for /health — avoids COUNT(*) on every API call
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agg_stats (
+                key   TEXT PRIMARY KEY,
+                value INTEGER DEFAULT 0
+            )
+        """)
+        # Seed default rows if not present
+        for key in ("total_players", "enriched_players", "total_matches"):
+            cursor.execute("INSERT OR IGNORE INTO agg_stats (key, value) VALUES (?, 0)", (key,))
+    except Exception as e:
+        print(f"Error creating agg_stats table: {e}")
+
+
+    try:
         print("Creating FTS5 trigram search index (players_search)...")
         # FTS5 trigram index allows fast substring/fuzzy matching on player names
         cursor.execute("""
