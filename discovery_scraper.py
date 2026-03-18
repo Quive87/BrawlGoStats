@@ -342,8 +342,19 @@ async def db_writer():
 
             # 1. Process Tags first (dependency for match_player)
             if "match_player" in grouped_ops:
-                tags = [(d[1],) for d in grouped_ops["match_player"]]
+                mp_params = [(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9],
+                              d[10] if len(d) > 10 else None,
+                              d[11] if len(d) > 11 else None,
+                              d[12] if len(d) > 12 else None)
+                             for d in grouped_ops["match_player"]]
+                tags = [(d[1],) for d in mp_params]
                 cursor.executemany("INSERT OR IGNORE INTO players (tag) VALUES (?)", tags)
+                cursor.executemany("""
+                    INSERT OR IGNORE INTO match_players
+                        (match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies,
+                         is_winner, team_id, trophy_change, result, mode, map, match_type)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, mp_params)
 
             # 2. Process Profiles (Optimized for 30M scale)
             if "profile" in grouped_ops:
@@ -397,14 +408,8 @@ async def db_writer():
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, grouped_ops["match"])
 
-            # 7. Process match_players
-            if "match_player" in grouped_ops:
-                cursor.executemany("""
-                    INSERT OR IGNORE INTO match_players (
-                        match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies,
-                        is_winner, team_id, trophy_change, result
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, grouped_ops["match_player"])
+
+
 
             # 8. Process scan_done
             if "scan_done" in grouped_ops:
@@ -524,7 +529,7 @@ async def queue_battlelog_data(tag, log_data):
         for p in players_to_process:
             for b in p["brawlers"]:
                 if not b: continue
-                await db_queue.put(("match_player", (match_id, p["tag"], b.get("name"), b.get("id"), b.get("power"), b.get("trophies"), p["is_winner"], p["team_id"], p["trophy_change"], p["result"])))
+                await db_queue.put(("match_player", (match_id, p["tag"], b.get("name"), b.get("id"), b.get("power"), b.get("trophies"), p["is_winner"], p["team_id"], p["trophy_change"], p["result"], mode, map_name, item["battle"].get("type"))))
 
 async def worker_task(session):
     while True:

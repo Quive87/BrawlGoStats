@@ -75,6 +75,9 @@ def migrate():
             team_id INTEGER,
             trophy_change INTEGER,
             result TEXT,
+            mode TEXT,
+            map TEXT,
+            match_type TEXT,
             PRIMARY KEY (match_id, player_tag, brawler_id)
         )
     """)
@@ -90,7 +93,6 @@ def migrate():
         print("Updating 'match_players' columns...")
         cursor.execute("ALTER TABLE match_players ADD COLUMN player_name TEXT;")
     except sqlite3.OperationalError: pass # Already exists
-
     try:
         cursor.execute("ALTER TABLE match_players ADD COLUMN trophy_change INTEGER;")
     except sqlite3.OperationalError: pass
@@ -99,6 +101,16 @@ def migrate():
     except sqlite3.OperationalError: pass
     try:
         cursor.execute("ALTER TABLE match_players ADD COLUMN skin_id INTEGER;")
+    except sqlite3.OperationalError: pass
+    # Denormalized columns for JOIN-free aggregation (eliminates 582s brawler_meta scan)
+    try:
+        cursor.execute("ALTER TABLE match_players ADD COLUMN mode TEXT;")
+    except sqlite3.OperationalError: pass
+    try:
+        cursor.execute("ALTER TABLE match_players ADD COLUMN map TEXT;")
+    except sqlite3.OperationalError: pass
+    try:
+        cursor.execute("ALTER TABLE match_players ADD COLUMN match_type TEXT;")
     except sqlite3.OperationalError: pass
 
     try:
