@@ -9,9 +9,12 @@ DB = "/var/www/BrawlGoStats/brawl_data.sqlite"
 if not os.path.exists(DB):
     DB = "brawl_data.sqlite"
 
-conn = sqlite3.connect(DB, timeout=120)
+# isolation_level=None = autocommit mode so we can manually control transactions
+conn = sqlite3.connect(DB, timeout=120, isolation_level=None)
 conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
+# Grab an exclusive lock immediately — nothing else can write while we work
+conn.execute("BEGIN EXCLUSIVE")
 c = conn.cursor()
 
 # 1. agg_stats
