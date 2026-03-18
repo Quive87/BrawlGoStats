@@ -58,6 +58,8 @@ def migrate():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_filter ON matches(mode, type, battle_time);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_time ON matches(battle_time);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_map ON matches(map);")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS match_players (
@@ -155,6 +157,8 @@ def migrate():
             """)
             cursor.execute("DROP TABLE match_players_old;")
             print("Successfully updated 'match_players' Primary Key.")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_players_match_id ON match_players(match_id);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_players_brawler ON match_players(brawler_name, brawler_id);")
     except Exception as e:
         print(f"Error migrating match_players: {e}")
 
