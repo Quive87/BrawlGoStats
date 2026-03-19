@@ -1,0 +1,11 @@
+[Unit]
+Description=BrawlGo Aggregator Timer (every 60 seconds)
+
+[Timer]
+OnActiveSec=60
+OnUnitActiveSec=60
+AccuracySec=5
+Unit=brawl-aggregator.service
+
+[Install]
+WantedBy=timers.target

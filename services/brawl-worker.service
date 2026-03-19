@@ -1,12 +1,15 @@
 [Unit]
-Description=BrawlGo Data Fetcher (Go)
+Description=BrawlGo Unified Worker (Enrichment + Discovery)
 After=network.target
 
 [Service]
 User=root
 WorkingDirectory=/var/www/BrawlGoStats/worker
-ExecStart=/var/www/BrawlGoStats/worker/worker
+ExecStart=/var/www/BrawlGoStats/worker/brawl-worker
 Restart=always
+RestartSec=5
+# Tune OS limits for many goroutines
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

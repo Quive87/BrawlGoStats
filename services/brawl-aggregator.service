@@ -1,0 +1,14 @@
+[Unit]
+Description=BrawlGo Aggregator (DuckDB pre-aggregation, oneshot)
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/var/www/BrawlGoStats
+ExecStart=/var/www/BrawlGoStats/venv/bin/python3 aggregator.py
+Type=oneshot
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

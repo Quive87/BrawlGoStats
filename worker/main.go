@@ -17,150 +17,109 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
-	_ "modernc.org/sqlite" // Pure Go SQLite (No CGO required)
+	_ "modernc.org/sqlite"
 )
+
+// ─── Config ──────────────────────────────────────────────────────────────────
 
 const (
 	dbPath        = "/var/www/BrawlGoStats/brawl_data.sqlite"
 	baseURL       = "https://api.brawlstars.com/v1"
-	poolSize      = 64   // Increased concurrent workers
-	batchLoadSize = 1000 // Larger batch to reduce DB contention
+	lockFile      = "/tmp/brawl-worker.lock"
+	batchLoadSize = 2000 // tags fetched per DB poll
 )
 
-type Payload struct {
-	Match  []interface{} // Match data args: match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id
-	Player []interface{} // Match_Player data args: match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, skin_id, is_winner, team_id, trophy_change, result
-	Upsert []interface{} // Player upsert args: tag, name
-	NewTag string
+// ─── Rate Limiter (Token Bucket) ─────────────────────────────────────────────
+
+type TokenBucket struct {
+	mu       sync.Mutex
+	tokens   float64
+	maxRate  float64 // tokens per second
+	lastFill time.Time
 }
+
+func NewTokenBucket(rps float64) *TokenBucket {
+	return &TokenBucket{tokens: rps, maxRate: rps, lastFill: time.Now()}
+}
+
+func (tb *TokenBucket) Wait() {
+	for {
+		tb.mu.Lock()
+		now := time.Now()
+		elapsed := now.Sub(tb.lastFill).Seconds()
+		tb.tokens = min(tb.maxRate, tb.tokens+elapsed*tb.maxRate)
+		tb.lastFill = now
+		if tb.tokens >= 1 {
+			tb.tokens--
+			tb.mu.Unlock()
+			return
+		}
+		tb.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func min(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// ─── Metrics ─────────────────────────────────────────────────────────────────
 
 var (
-	tagsProcessed uint64
-	rateLimitsHit uint64
-	errorsHit     uint64
+	totalRequests  uint64
+	enriched       uint64
+	discovered     uint64
+	rateLimitsHit  uint64
+	errors429      uint64
+	errorsOther    uint64
 )
 
-func main() {
-	_ = godotenv.Load("../.env")
-	apiToken := os.Getenv("SUPERCELL_API_TOKEN")
-	if apiToken == "" {
-		fmt.Println("ERROR: SUPERCELL_API_TOKEN not found in .env")
-		os.Exit(1)
-	}
+// ─── DB Write Payloads ───────────────────────────────────────────────────────
 
-	// Connect to shared SQLite with WAL mode
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_sync=NORMAL")
-	if err != nil {
-		fmt.Printf("DB Connect Error: %v\n", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-
-	// Prep the job channel (Buffered for high-throughput)
-	jobs := make(chan string, batchLoadSize*2)
-	var wg sync.WaitGroup
-
-	// High-throughput HTTP client
-	client := &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConns:        poolSize,
-			MaxIdleConnsPerHost: poolSize,
-			IdleConnTimeout:     30 * time.Second,
-		},
-		Timeout: 10 * time.Second,
-	}
-
-	// Start DB Writer
-	dbWriterChan := make(chan Payload, 5000)
-	var dbWg sync.WaitGroup
-	dbWg.Add(1)
-	go databaseWriter(db, dbWriterChan, &dbWg)
-
-	// Start concurrent workers
-	for w := 1; w <= poolSize; w++ {
-		wg.Add(1)
-		go worker(jobs, &wg, client, apiToken, dbWriterChan, db)
-	}
-
-	// Start Metrics Reporter
-	go reporter()
-
-	fmt.Printf("--- Native High-Speed Worker Started (%d workers) --- \n", poolSize)
-
-	// Shutdown listener
-	sigchan := make(chan os.Signal, 1)
-	signal.Notify(sigchan, syscall.SIGINT, syscall.SIGTERM)
-
-	for {
-		select {
-		case <-sigchan:
-			fmt.Println("Shutting down...")
-			close(jobs)
-			wg.Wait()
-			close(dbWriterChan)
-			dbWg.Wait()
-			return
-		default:
-			// Fill the jobs queue if it's running low (Reduce starvation)
-			if len(jobs) < poolSize {
-				tags := fetchUnprocessedTags(db, batchLoadSize)
-				if len(tags) == 0 {
-					time.Sleep(2 * time.Second) // Wait for Python scraper
-					continue
-				}
-				for _, t := range tags {
-					jobs <- t
-				}
-			}
-			time.Sleep(50 * time.Millisecond) // More responsive loop
-		}
-	}
+type WriteOp struct {
+	opType string
+	data   interface{}
 }
 
-func fetchUnprocessedTags(db *sql.DB, limit int) []string {
-	rows, err := db.Query("SELECT tag FROM players WHERE last_battlelog_scan IS NULL OR last_battlelog_scan < datetime('now', '-1 day') LIMIT ?", limit)
-	if err != nil {
-		fmt.Printf("Query Error: %v\n", err)
-		return nil
-	}
-	defer rows.Close()
+// ─── API Types ───────────────────────────────────────────────────────────────
 
-	var tags []string
-	for rows.Next() {
-		var tag string
-		if err := rows.Scan(&tag); err == nil {
-			tags = append(tags, tag)
-		}
-	}
-	return tags
+type ProfileResponse struct {
+	Tag                                string  `json:"tag"`
+	Name                               string  `json:"name"`
+	Trophies                           int     `json:"trophies"`
+	HighestTrophies                    int     `json:"highestTrophies"`
+	TotalPrestigeLevel                 int     `json:"totalPrestigeLevel"`
+	ExpLevel                           int     `json:"expLevel"`
+	ExpPoints                          int     `json:"expPoints"`
+	IsQualifiedFromChampionshipChallenge bool   `json:"isQualifiedFromChampionshipChallenge"`
+	Victories3v3                       int     `json:"3vs3Victories"`
+	SoloVictories                      int     `json:"soloVictories"`
+	DuoVictories                       int     `json:"duoVictories"`
+	Icon                               struct {
+		ID int `json:"id"`
+	} `json:"icon"`
+	Club struct {
+		Tag  string `json:"tag"`
+		Name string `json:"name"`
+	} `json:"club"`
+	Brawlers []json.RawMessage `json:"brawlers"`
 }
 
-type PlayerInfo struct {
-	Tag  string `json:"tag"`
-	Name string `json:"name"`
-	// Standard brawler object
-	Brawler struct {
-		ID       int    `json:"id"`
-		Name     string `json:"name"`
-		Power    int    `json:"power"`
-		Trophies int    `json:"trophies"`
-		Skin     struct {
-			ID   int    `json:"id"`
-			Name string `json:"name"`
-		} `json:"skin"`
-	} `json:"brawler"`
-	// Duels: multiple brawlers
-	Brawlers []struct {
-		ID           int    `json:"id"`
-		Name         string `json:"name"`
-		Power        int    `json:"power"`
-		Trophies     int    `json:"trophies"`
-		TrophyChange int    `json:"trophyChange"`
-	} `json:"brawlers"`
-	TrophyChange int    `json:"trophyChange"`
-	Result       string `json:"-"`
-	IsWinner     int    `json:"-"`
-	TeamID       int    `json:"-"`
+type BrawlerItem struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Trophies    int    `json:"trophies"`
+	Skin        *struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	} `json:"skin"`
+	Gadgets     []struct{ ID int; Name string } `json:"gadgets"`
+	StarPowers  []struct{ ID int; Name string } `json:"starPowers"`
+	Gears       []struct{ ID int; Name string } `json:"gears"`
+	HyperCharges []struct{ ID int; Name string } `json:"hyperCharges"`
 }
 
 type BattleEntry struct {
@@ -177,7 +136,7 @@ type BattleEntry struct {
 		Duration     int    `json:"duration"`
 		Rank         int    `json:"rank"`
 		TrophyChange int    `json:"trophyChange"`
-		StarPlayer   struct {
+		StarPlayer   *struct {
 			Tag string `json:"tag"`
 		} `json:"starPlayer"`
 		Teams   [][]PlayerInfo `json:"teams"`
@@ -185,59 +144,477 @@ type BattleEntry struct {
 	} `json:"battle"`
 }
 
-type BattleLogResponse struct {
-	Items []BattleEntry `json:"items"`
+type PlayerInfo struct {
+	Tag     string `json:"tag"`
+	Name    string `json:"name"`
+	Brawler *struct {
+		ID       int    `json:"id"`
+		Name     string `json:"name"`
+		Power    int    `json:"power"`
+		Trophies int    `json:"trophies"`
+		Skin     *struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		} `json:"skin"`
+	} `json:"brawler"`
+	Brawlers []struct {
+		ID           int    `json:"id"`
+		Name         string `json:"name"`
+		Power        int    `json:"power"`
+		Trophies     int    `json:"trophies"`
+		TrophyChange int    `json:"trophyChange"`
+	} `json:"brawlers"`
+	TrophyChange int `json:"-"` // set externally
+	IsWinner     int `json:"-"`
+	Result       string `json:"-"`
+	TeamID       int    `json:"-"`
 }
 
+type ClubMembersResponse struct {
+	Items []struct {
+		Tag string `json:"tag"`
+	} `json:"items"`
+}
 
-func worker(jobs <-chan string, wg *sync.WaitGroup, client *http.Client, token string, out chan<- Payload, db *sql.DB) {
-	defer wg.Done()
+// ─── Main ────────────────────────────────────────────────────────────────────
 
-	for tag := range jobs {
-		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/players/%%23%s/battlelog", baseURL, tag), nil)
-		req.Header.Add("Authorization", "Bearer "+token)
+func main() {
+	// Load .env from project root
+	_ = godotenv.Load("/var/www/BrawlGoStats/.env")
+	if _, err := os.Stat("/var/www/BrawlGoStats/.env"); err != nil {
+		_ = godotenv.Load(".env")
+	}
 
-		resp, err := client.Do(req)
-		if err != nil {
-			atomic.AddUint64(&errorsHit, 1)
+	apiToken := os.Getenv("SUPERCELL_API_TOKEN")
+	if apiToken == "" {
+		fmt.Fprintln(os.Stderr, "FATAL: SUPERCELL_API_TOKEN not set")
+		os.Exit(1)
+	}
+
+	// Worker count from env (default 120)
+	numWorkers := 120
+	if v := os.Getenv("WORKER_COUNT"); v != "" {
+		fmt.Sscanf(v, "%d", &numWorkers)
+	}
+
+	// Lock file — prevent double-start
+	if _, err := os.Stat(lockFile); err == nil {
+		fmt.Fprintln(os.Stderr, "FATAL: another instance is already running (lock file exists). Remove", lockFile, "to override.")
+		os.Exit(1)
+	}
+	lf, err := os.Create(lockFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "FATAL: cannot create lock file:", err)
+		os.Exit(1)
+	}
+	lf.Close()
+	defer os.Remove(lockFile)
+
+	// DB connect (WAL, tuned PRAGMAs)
+	db, err := sql.Open("sqlite", dbPath+
+		"?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-65536&_temp_store=MEMORY")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "FATAL: DB connect:", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)  // SQLite: serialise writers
+	db.SetMaxIdleConns(1)
+
+	// HTTP client — reused by all workers
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:          numWorkers + 20,
+			MaxIdleConnsPerHost:   numWorkers + 20,
+			IdleConnTimeout:       60 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
+		},
+		Timeout: 20 * time.Second,
+	}
+
+	// Rate limiter: 70 RPS (safe side of 75-80 limit)
+	rateLimiter := NewTokenBucket(70)
+
+	// Channels
+	enrichQueue := make(chan string, 20000)  // priority: profile enrichment
+	discovQueue := make(chan string, 10000)  // secondary: battlelog discovery
+	dbChan      := make(chan WriteOp, 50000) // DB write queue
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// ── Seed empty DB from leaderboard ──
+	go func() {
+		if isEmpty(db) {
+			fmt.Println("[SEED] DB is empty — seeding from global/country leaderboards...")
+			seedFromLeaderboard(httpClient, apiToken, enrichQueue)
+			fmt.Println("[SEED] Done.")
+		}
+	}()
+
+	// ── DB Writer goroutine ──
+	wg.Add(1)
+	go dbWriter(db, dbChan, &wg)
+
+	// ── Workers ──
+	// 80% enrichment, 20% discovery
+	enrichWorkers := numWorkers * 4 / 5
+	discovWorkers := numWorkers - enrichWorkers
+
+	for i := 0; i < enrichWorkers; i++ {
+		wg.Add(1)
+		go enrichWorker(enrichQueue, dbChan, httpClient, apiToken, rateLimiter, done, &wg)
+	}
+	for i := 0; i < discovWorkers; i++ {
+		wg.Add(1)
+		go discoveryWorker(discovQueue, enrichQueue, dbChan, httpClient, apiToken, rateLimiter, done, &wg)
+	}
+
+	// ── Queue filler goroutine ──
+	go queueFiller(db, enrichQueue, discovQueue, done)
+
+	// ── Metrics reporter ──
+	go reporter()
+
+	fmt.Printf("[BRAWL-WORKER] Started: %d enrichment workers + %d discovery workers (70 RPS limit)\n",
+		enrichWorkers, discovWorkers)
+
+	// ── Graceful shutdown ──
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+
+	fmt.Println("[BRAWL-WORKER] Shutting down...")
+	close(done)
+	wg.Wait()
+	close(dbChan)
+	fmt.Println("[BRAWL-WORKER] Stopped.")
+}
+
+// ─── isEmpty ────────────────────────────────────────────────────────────────
+
+func isEmpty(db *sql.DB) bool {
+	var count int
+	_ = db.QueryRow("SELECT COUNT(*) FROM players").Scan(&count)
+	return count == 0
+}
+
+// ─── seedFromLeaderboard ────────────────────────────────────────────────────
+
+func seedFromLeaderboard(client *http.Client, token string, out chan<- string) {
+	countryCodes := []string{
+		"global", "af", "al", "dz", "ar", "am", "au", "at", "az", "bs", "bh", "bd", "be", "bz",
+		"bj", "bt", "bo", "ba", "bw", "br", "bn", "bg", "bf", "bi", "kh", "cm", "ca", "cv", "cf",
+		"td", "cl", "cn", "co", "cg", "cr", "ci", "hr", "cu", "cy", "cz", "dk", "do", "ec", "eg",
+		"sv", "er", "et", "fj", "fi", "fr", "ga", "gm", "ge", "de", "gh", "gr", "gt", "gn", "gy",
+		"ht", "hn", "hk", "hu", "is", "in", "id", "ir", "iq", "ie", "il", "it", "jm", "jp", "jo",
+		"kz", "ke", "kw", "kg", "la", "lv", "lb", "ls", "lr", "ly", "li", "lt", "lu", "mg", "mw",
+		"my", "mv", "ml", "mt", "mr", "mu", "mx", "md", "mc", "mn", "me", "ma", "mz", "mm", "na",
+		"np", "nl", "nz", "ni", "ne", "ng", "no", "om", "pk", "pa", "pg", "py", "pe", "ph", "pl",
+		"pt", "pr", "qa", "ro", "ru", "rw", "sa", "sn", "rs", "sl", "sg", "sk", "si", "so", "za",
+		"kr", "es", "lk", "sd", "se", "ch", "tw", "tj", "tz", "th", "tg", "to", "tt", "tn", "tr",
+		"tm", "ug", "ua", "ae", "gb", "us", "uy", "uz", "ve", "vn", "ye", "zm", "zw",
+	}
+
+	seen := make(map[string]bool)
+	for _, code := range countryCodes {
+		url := fmt.Sprintf("%s/rankings/%s/players", baseURL, code)
+		body, status := doGET(client, url, token)
+		if status != 200 || body == nil {
 			continue
 		}
-
-		atomic.AddUint64(&tagsProcessed, 1)
-
-		switch resp.StatusCode {
-		case 429:
-			atomic.AddUint64(&rateLimitsHit, 1)
-			time.Sleep(5 * time.Second)
-		case 200:
-			body, _ := io.ReadAll(resp.Body)
-			var logData BattleLogResponse
-			if err := json.Unmarshal(body, &logData); err == nil {
-				processSnowball(logData, out)
+		var resp struct {
+			Items []struct{ Tag string `json:"tag"` } `json:"items"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			continue
+		}
+		for _, p := range resp.Items {
+			tag := cleanTag(p.Tag)
+			if tag != "" && !seen[tag] {
+				seen[tag] = true
+				select {
+				case out <- tag:
+				default:
+				}
 			}
-			// Mark as scanned
-			_, _ = db.Exec("UPDATE players SET last_battlelog_scan = datetime('now') WHERE tag = ?", tag)
+		}
+	}
+	fmt.Printf("[SEED] Queued %d unique tags from leaderboards\n", len(seen))
+}
+
+// ─── Queue Filler ────────────────────────────────────────────────────────────
+
+func queueFiller(db *sql.DB, enrichQ, discovQ chan string, done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
 		default:
-			atomic.AddUint64(&errorsHit, 1)
 		}
 
-		resp.Body.Close()
+		// Fill enrichment queue (priority)
+		if len(enrichQ) < 5000 {
+			rows, _ := db.Query(`
+				SELECT tag FROM players
+				WHERE profile_updated_at IS NULL
+				LIMIT ?`, batchLoadSize)
+			if rows != nil {
+				count := 0
+				for rows.Next() {
+					var tag string
+					if rows.Scan(&tag) == nil {
+						select {
+						case enrichQ <- tag:
+							count++
+						default:
+						}
+					}
+				}
+				rows.Close()
+				if count > 0 {
+					fmt.Printf("[FILLER] Fed %d tags → enrichment queue\n", count)
+				}
+			}
+		}
+
+		// Fill discovery queue (only when enrichment is nearly empty)
+		if len(enrichQ) < 500 && len(discovQ) < 2000 {
+			rows, _ := db.Query(`
+				SELECT tag FROM players
+				WHERE profile_updated_at IS NOT NULL
+				  AND (last_battlelog_scan IS NULL OR last_battlelog_scan < datetime('now', '-1 day'))
+				LIMIT ?`, batchLoadSize/2)
+			if rows != nil {
+				for rows.Next() {
+					var tag string
+					if rows.Scan(&tag) == nil {
+						select {
+						case discovQ <- tag:
+						default:
+						}
+					}
+				}
+				rows.Close()
+			}
+		}
+
+		time.Sleep(3 * time.Second)
 	}
 }
 
-func processSnowball(data BattleLogResponse, out chan<- Payload) {
-	today := time.Now().UTC().Format("20060102")
-	discoveredTags := make(map[string]bool)
+// ─── Enrichment Worker ───────────────────────────────────────────────────────
 
-	for _, item := range data.Items {
-		isToday := strings.HasPrefix(item.BattleTime, today)
+func enrichWorker(
+	queue chan string,
+	dbChan chan<- WriteOp,
+	client *http.Client,
+	token string,
+	rl *TokenBucket,
+	done <-chan struct{},
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+	seenClubs := make(map[string]bool)
 
+	for {
+		select {
+		case <-done:
+			return
+		case tag, ok := <-queue:
+			if !ok {
+				return
+			}
+			rl.Wait()
+			body, status := doGET(client, fmt.Sprintf("%s/players/%%23%s", baseURL, tag), token)
+			atomic.AddUint64(&totalRequests, 1)
+
+			if status == 429 {
+				atomic.AddUint64(&rateLimitsHit, 1)
+				atomic.AddUint64(&errors429, 1)
+				time.Sleep(2 * time.Second)
+				// Re-queue
+				select {
+				case queue <- tag:
+				default:
+				}
+				continue
+			}
+			if status != 200 || body == nil {
+				if status == 404 {
+					dbChan <- WriteOp{"status_404", tag}
+				} else {
+					atomic.AddUint64(&errorsOther, 1)
+				}
+				continue
+			}
+
+			var p ProfileResponse
+			if err := json.Unmarshal(body, &p); err != nil {
+				atomic.AddUint64(&errorsOther, 1)
+				continue
+			}
+
+			// Compress brawlers blob
+			brawlersJSON, _ := json.Marshal(p.Brawlers)
+
+			clubTag := cleanTag(p.Club.Tag)
+			dbChan <- WriteOp{"profile", profileData{
+				Tag:            tag,
+				Name:           p.Name,
+				Trophies:       p.Trophies,
+				HighestTrophies: p.HighestTrophies,
+				TotalPrestige:  p.TotalPrestigeLevel,
+				ExpLevel:       p.ExpLevel,
+				ExpPoints:      p.ExpPoints,
+				IsQualified:    boolToInt(p.IsQualifiedFromChampionshipChallenge),
+				Victories3v3:   p.Victories3v3,
+				VictoriesSolo:  p.SoloVictories,
+				VictoriesDuo:   p.DuoVictories,
+				ClubTag:        clubTag,
+				ClubName:       p.Club.Name,
+				IconID:         p.Icon.ID,
+				BrawlersData:   brawlersJSON,
+			}}
+			atomic.AddUint64(&enriched, 1)
+
+			// Write per-brawler data
+			for _, raw := range p.Brawlers {
+				var b BrawlerItem
+				if err := json.Unmarshal(raw, &b); err != nil {
+					continue
+				}
+				skinID, skinName := 0, ""
+				if b.Skin != nil {
+					skinID = b.Skin.ID
+					skinName = b.Skin.Name
+				}
+				dbChan <- WriteOp{"brawler", brawlerData{PlayerTag: tag, BrawlerID: b.ID, BrawlerName: b.Name, Trophies: b.Trophies, SkinID: skinID, SkinName: skinName}}
+				dbChan <- WriteOp{"brawler_stat", brawlerStatData{b.ID, b.Name}}
+				for _, g := range b.Gadgets {
+					dbChan <- WriteOp{"build", buildData{b.ID, g.ID, "gadget", g.Name}}
+				}
+				for _, sp := range b.StarPowers {
+					dbChan <- WriteOp{"build", buildData{b.ID, sp.ID, "starpower", sp.Name}}
+				}
+				for _, gr := range b.Gears {
+					dbChan <- WriteOp{"build", buildData{b.ID, gr.ID, "gear", gr.Name}}
+				}
+				for _, hc := range b.HyperCharges {
+					dbChan <- WriteOp{"build", buildData{b.ID, hc.ID, "hypercharge", hc.Name}}
+				}
+			}
+
+			// Club snowball: discover members
+			if clubTag != "" && !seenClubs[clubTag] {
+				seenClubs[clubTag] = true
+				if len(seenClubs) > 30000 {
+					seenClubs = make(map[string]bool)
+				}
+				rl.Wait()
+				cBody, cStatus := doGET(client, fmt.Sprintf("%s/clubs/%%23%s/members", baseURL, clubTag), token)
+				atomic.AddUint64(&totalRequests, 1)
+				if cStatus == 200 && cBody != nil {
+					var cr ClubMembersResponse
+					if json.Unmarshal(cBody, &cr) == nil {
+						for _, m := range cr.Items {
+							mt := cleanTag(m.Tag)
+							if mt != "" {
+								dbChan <- WriteOp{"new_tag", mt}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// ─── Discovery Worker ────────────────────────────────────────────────────────
+
+func discoveryWorker(
+	queue chan string,
+	enrichQ chan string,
+	dbChan chan<- WriteOp,
+	client *http.Client,
+	token string,
+	rl *TokenBucket,
+	done <-chan struct{},
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-done:
+			return
+		case tag, ok := <-queue:
+			if !ok {
+				return
+			}
+			rl.Wait()
+			body, status := doGET(client, fmt.Sprintf("%s/players/%%23%s/battlelog", baseURL, tag), token)
+			atomic.AddUint64(&totalRequests, 1)
+
+			if status == 429 {
+				atomic.AddUint64(&rateLimitsHit, 1)
+				atomic.AddUint64(&errors429, 1)
+				time.Sleep(2 * time.Second)
+				select {
+				case queue <- tag:
+				default:
+				}
+				continue
+			}
+			if status != 200 || body == nil {
+				atomic.AddUint64(&errorsOther, 1)
+				continue
+			}
+
+			var resp struct {
+				Items []BattleEntry `json:"items"`
+			}
+			if json.Unmarshal(body, &resp) != nil {
+				atomic.AddUint64(&errorsOther, 1)
+				continue
+			}
+
+			newTags := processBattlelog(resp.Items, dbChan)
+			for _, t := range newTags {
+				dbChan <- WriteOp{"new_tag", t}
+			}
+			dbChan <- WriteOp{"scan_done", tag}
+			atomic.AddUint64(&discovered, 1)
+		}
+	}
+}
+
+// ─── processBattlelog ────────────────────────────────────────────────────────
+
+func processBattlelog(items []BattleEntry, dbChan chan<- WriteOp) []string {
+	var newTags []string
+	seenTags := make(map[string]bool)
+
+	for _, item := range items {
+		if item.Battle.Type == "friendly" {
+			continue
+		}
 		mode := item.Event.Mode
 		if mode == "" {
 			mode = item.Battle.Mode
 		}
+		mapName := item.Event.Map
+		mapID := item.Event.ID
+		duration := item.Battle.Duration
+		battleTrophyChange := item.Battle.TrophyChange
 
-		// Determine base winner team (for 3v3)
+		starTag := ""
+		if item.Battle.StarPlayer != nil {
+			starTag = cleanTag(item.Battle.StarPlayer.Tag)
+		}
+
+		// Determine winner team index
 		winnerTeam := -1
 		switch item.Battle.Result {
 		case "victory":
@@ -246,175 +623,357 @@ func processSnowball(data BattleLogResponse, out chan<- Payload) {
 			winnerTeam = 1
 		}
 
-		var playersToProcess []PlayerInfo
-
-		// 1. Process Teams (3v3 / Duo Showdown)
+		var players []PlayerInfo
+		// Team modes
 		for i, team := range item.Battle.Teams {
 			for _, p := range team {
-				p.TeamID = i
-				// Team games: API gives trophyChange at battle level, use it for each player
-				p.TrophyChange = item.Battle.TrophyChange
-				// Win Condition: 3v3 Result or Duo Rank 1-2
+				pc := p
+				pc.TeamID = i
+				pc.TrophyChange = battleTrophyChange
 				if i == winnerTeam || (item.Battle.Mode == "duoShowdown" && item.Battle.Rank <= 2) {
-					p.IsWinner = 1
-					p.Result = "victory"
+					pc.IsWinner = 1
+					pc.Result = "victory"
 				} else {
-					p.IsWinner = 0
-					p.Result = "defeat"
+					pc.IsWinner = 0
+					pc.Result = "defeat"
 				}
-				playersToProcess = append(playersToProcess, p)
+				players = append(players, pc)
 			}
 		}
-
-		// 2. Process Players (Solo Showdown / Duels)
+		// Solo modes
 		for _, p := range item.Battle.Players {
-			p.TeamID = 0
-			// Win Condition: Solo Showdown Rank 1-4 or Duels victory
-			if (item.Battle.Mode == "soloShowdown" && item.Battle.Rank <= 4) || item.Battle.Result == "victory" {
-				p.IsWinner = 1
-				p.Result = "victory"
+			pc := p
+			pc.TeamID = 0
+			pc.TrophyChange = battleTrophyChange
+			if (item.Battle.Mode == "soloShowdown" && item.Battle.Rank <= 4) ||
+				item.Battle.Result == "victory" {
+				pc.IsWinner = 1
+				pc.Result = "victory"
 			} else {
-				p.IsWinner = 0
-				p.Result = "defeat"
+				pc.IsWinner = 0
+				pc.Result = "defeat"
 			}
-			playersToProcess = append(playersToProcess, p)
+			players = append(players, pc)
 		}
 
-		// Sort tags for deterministic Match ID
+		if len(players) == 0 {
+			continue
+		}
+
+		// Deterministic match ID
 		var allTags []string
-		for _, p := range playersToProcess {
-			if len(p.Tag) >= 2 {
-				allTags = append(allTags, p.Tag)
+		for _, p := range players {
+			t := cleanTag(p.Tag)
+			if t != "" {
+				allTags = append(allTags, t)
 			}
 		}
 		sort.Strings(allTags)
-		allTagsStr := strings.Join(allTags, ",")
-		hashInput := fmt.Sprintf("%s|%d|%s|%s", item.BattleTime, item.Event.ID, allTagsStr, item.Event.Map)
-		matchID := fmt.Sprintf("%s-%x", item.BattleTime, sha256.Sum256([]byte(hashInput)))
+		hashInput := fmt.Sprintf("%s|%d|%s|%s", item.BattleTime, mapID, strings.Join(allTags, ","), mapName)
+		matchID := fmt.Sprintf("%s-%x", item.BattleTime, sha256.Sum256([]byte(hashInput)))[:40]
 
-		// 3. Snowball and Output
-		for _, p := range playersToProcess {
-			cleanTag := strings.TrimPrefix(p.Tag, "#")
-			cleanTag = strings.ToUpper(cleanTag)
-			if cleanTag == "" {
+		dbChan <- WriteOp{"match", matchData{
+			MatchID:       matchID,
+			BattleTime:    item.BattleTime,
+			Mode:          mode,
+			Type:          item.Battle.Type,
+			Map:           mapName,
+			MapID:         mapID,
+			Duration:      duration,
+			StarPlayerTag: starTag,
+			EventID:       mapID,
+			ModeID:        0,
+		}}
+
+		for _, p := range players {
+			ptag := cleanTag(p.Tag)
+			if ptag == "" {
 				continue
 			}
+			if !seenTags[ptag] {
+				seenTags[ptag] = true
+				newTags = append(newTags, ptag)
+			}
 
-			discoveredTags[cleanTag] = true
-
-			if isToday {
-				// Base Match Info
-				starPlayerTag := strings.TrimPrefix(item.Battle.StarPlayer.Tag, "#")
-				starPlayerTag = strings.ToUpper(starPlayerTag)
-				out <- Payload{Match: []any{matchID, item.BattleTime, mode, item.Battle.Type, item.Event.Map, item.Event.ID, item.Battle.Duration, starPlayerTag, item.Event.ID}}
-				out <- Payload{Upsert: []any{cleanTag, p.Name}}
-
-				// Handle Multiple Brawlers (Duels)
-				if len(p.Brawlers) > 0 {
-					for _, b := range p.Brawlers {
-						out <- Payload{Player: []any{
-							matchID, cleanTag, b.Name, b.ID, b.Power, b.Trophies,
-							"", 0, // Skin unknown in some Duels logs
-							p.IsWinner, p.TeamID, b.TrophyChange, p.Result,
-						}}
-					}
-				} else {
-					// Standard Single Brawler
-					out <- Payload{Player: []any{
-						matchID, cleanTag, p.Brawler.Name, p.Brawler.ID, p.Brawler.Power, p.Brawler.Trophies,
-						p.Brawler.Skin.Name, p.Brawler.Skin.ID,
-						p.IsWinner, p.TeamID, p.TrophyChange, p.Result,
-					}}
+			if p.Brawler != nil {
+				skinID, skinName := 0, ""
+				if p.Brawler.Skin != nil {
+					skinID = p.Brawler.Skin.ID
+					skinName = p.Brawler.Skin.Name
 				}
+				dbChan <- WriteOp{"match_player", matchPlayerData{
+					MatchID:        matchID,
+					PlayerTag:      ptag,
+					BrawlerName:    p.Brawler.Name,
+					BrawlerID:      p.Brawler.ID,
+					BrawlerPower:   p.Brawler.Power,
+					BrawlerTrophies: p.Brawler.Trophies,
+					SkinName:       skinName,
+					SkinID:         skinID,
+					IsWinner:       p.IsWinner,
+					TeamID:         p.TeamID,
+					TrophyChange:   p.TrophyChange,
+					Result:         p.Result,
+					Mode:           mode,
+					Map:            mapName,
+					MatchType:      item.Battle.Type,
+				}}
+			}
+			// Duels
+			for _, b := range p.Brawlers {
+				dbChan <- WriteOp{"match_player", matchPlayerData{
+					MatchID:        matchID,
+					PlayerTag:      ptag,
+					BrawlerName:    b.Name,
+					BrawlerID:      b.ID,
+					BrawlerPower:   b.Power,
+					BrawlerTrophies: b.Trophies,
+					IsWinner:       p.IsWinner,
+					TeamID:         p.TeamID,
+					TrophyChange:   b.TrophyChange,
+					Result:         p.Result,
+					Mode:           mode,
+					Map:            mapName,
+					MatchType:      item.Battle.Type,
+				}}
 			}
 		}
 	}
-
-	if len(discoveredTags) > 0 {
-		for t := range discoveredTags {
-			cleanTag := strings.TrimPrefix(t, "#")
-			cleanTag = strings.ToUpper(cleanTag)
-			out <- Payload{NewTag: cleanTag}
-		}
-	}
+	return newTags
 }
 
-// Single goroutine that batches DB writes to prevent SQL locks
-func databaseWriter(db *sql.DB, in <-chan Payload, wg *sync.WaitGroup) {
+// ─── DB Writer ───────────────────────────────────────────────────────────────
+
+type profileData struct {
+	Tag, Name, ClubTag, ClubName string
+	Trophies, HighestTrophies, TotalPrestige, ExpLevel, ExpPoints int
+	IsQualified, Victories3v3, VictoriesSolo, VictoriesDuo       int
+	IconID                                                         int
+	BrawlersData                                                   []byte
+}
+type brawlerData     struct{ PlayerTag, BrawlerName string; BrawlerID, Trophies, SkinID int; SkinName string }
+type brawlerStatData struct{ BrawlerID int; BrawlerName string }
+type buildData       struct{ BrawlerID, ItemID int; ItemType, ItemName string }
+type matchData       struct {
+	MatchID, BattleTime, Mode, Type, Map, StarPlayerTag string
+	MapID, Duration, EventID, ModeID                    int
+}
+type matchPlayerData struct {
+	MatchID, PlayerTag, BrawlerName, SkinName  string
+	BrawlerID, BrawlerPower, BrawlerTrophies   int
+	SkinID, IsWinner, TeamID, TrophyChange     int
+	Result, Mode, Map, MatchType               string
+}
+
+func dbWriter(db *sql.DB, in <-chan WriteOp, wg *sync.WaitGroup) {
 	defer wg.Done()
-	var batch []Payload
-	ticker := time.NewTicker(2 * time.Second) // Commit every 2 seconds or 500 records
-	defer ticker.Stop()
+
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+
+	var batch []WriteOp
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		flushBatch(db, batch)
+		batch = batch[:0]
+	}
 
 	for {
 		select {
-		case p, ok := <-in:
+		case op, ok := <-in:
 			if !ok {
-				flushBatch(db, batch)
+				flush()
 				return
 			}
-			batch = append(batch, p)
-			if len(batch) >= 500 { // Bulk insert threshold
-				flushBatch(db, batch)
-				batch = batch[:0]
+			batch = append(batch, op)
+			if len(batch) >= 1000 {
+				flush()
 			}
-		case <-ticker.C:
-			if len(batch) > 0 {
-				flushBatch(db, batch)
-				batch = batch[:0]
-			}
+		case <-tick.C:
+			flush()
 		}
 	}
 }
 
-func flushBatch(db *sql.DB, batch []Payload) {
+func flushBatch(db *sql.DB, batch []WriteOp) {
 	tx, err := db.Begin()
 	if err != nil {
-		fmt.Printf("TX Begin Error: %v\n", err)
+		fmt.Println("[DB] Begin error:", err)
 		return
 	}
 
-	stmtMatch, _ := tx.Prepare("INSERT OR IGNORE INTO matches (match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-	stmtPlayer, _ := tx.Prepare("INSERT OR IGNORE INTO match_players (match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies, skin_name, skin_id, is_winner, team_id, trophy_change, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-	stmtUpsert, _ := tx.Prepare(`
-		INSERT INTO players (tag, name) 
-		VALUES (?, ?) 
-		ON CONFLICT(tag) DO UPDATE SET 
-			name = excluded.name 
-		WHERE name IS NULL OR name = ''
-	`)
-	stmtNewTag, _ := tx.Prepare("INSERT OR IGNORE INTO players (tag) VALUES (?)")
+	stmts := map[string]*sql.Stmt{}
+	prepare := func(name, q string) *sql.Stmt {
+		if s, ok := stmts[name]; ok {
+			return s
+		}
+		s, e := tx.Prepare(q)
+		if e != nil {
+			fmt.Println("[DB] Prepare error:", name, e)
+			return nil
+		}
+		stmts[name] = s
+		return s
+	}
 
-	for _, p := range batch {
-		if p.Match != nil {
-			_, _ = stmtMatch.Exec(p.Match...)
-		}
-		if p.Player != nil {
-			_, _ = stmtPlayer.Exec(p.Player...)
-		}
-		if p.Upsert != nil {
-			_, _ = stmtUpsert.Exec(p.Upsert...)
-		}
-		if p.NewTag != "" {
-			_, _ = stmtNewTag.Exec(p.NewTag)
+	for _, op := range batch {
+		switch op.opType {
+		case "profile":
+			d := op.data.(profileData)
+			s := prepare("profile", `
+				UPDATE players SET
+					profile_updated_at=CURRENT_TIMESTAMP, is_processed=1,
+					name=?, icon_id=?, trophies=?, highest_trophies=?, total_prestige_level=?,
+					exp_level=?, exp_points=?, is_qualified_from_championship_challenge=?,
+					victories_3v3=?, victories_solo=?, victories_duo=?,
+					club_tag=?, club_name=?, brawlers_data=?
+				WHERE tag=?`)
+			if s != nil {
+				s.Exec(d.Name, d.IconID, d.Trophies, d.HighestTrophies, d.TotalPrestige,
+					d.ExpLevel, d.ExpPoints, d.IsQualified,
+					d.Victories3v3, d.VictoriesSolo, d.VictoriesDuo,
+					d.ClubTag, d.ClubName, d.BrawlersData, d.Tag)
+			}
+		case "brawler":
+			d := op.data.(brawlerData)
+			s := prepare("brawler", `
+				INSERT INTO player_brawlers (player_tag, brawler_id, brawler_name, trophies, skin_id, skin_name)
+				VALUES (?,?,?,?,?,?)
+				ON CONFLICT(player_tag, brawler_id) DO UPDATE SET
+					trophies=excluded.trophies, skin_id=excluded.skin_id, skin_name=excluded.skin_name`)
+			if s != nil {
+				s.Exec(d.PlayerTag, d.BrawlerID, d.BrawlerName, d.Trophies, d.SkinID, d.SkinName)
+			}
+		case "brawler_stat":
+			d := op.data.(brawlerStatData)
+			s := prepare("brawler_stat", `
+				INSERT INTO brawler_stats (brawler_id, brawler_name, player_count) VALUES (?,?,1)
+				ON CONFLICT(brawler_id) DO UPDATE SET
+					player_count=player_count+1, brawler_name=excluded.brawler_name`)
+			if s != nil {
+				s.Exec(d.BrawlerID, d.BrawlerName)
+			}
+		case "build":
+			d := op.data.(buildData)
+			s := prepare("build", `
+				INSERT INTO brawler_build_stats (brawler_id, item_id, item_type, item_name) VALUES (?,?,?,?)
+				ON CONFLICT(brawler_id, item_id) DO UPDATE SET equip_count=equip_count+1`)
+			if s != nil {
+				s.Exec(d.BrawlerID, d.ItemID, d.ItemType, d.ItemName)
+			}
+		case "match":
+			d := op.data.(matchData)
+			s := prepare("match", `
+				INSERT OR IGNORE INTO matches
+				(match_id, battle_time, mode, type, map, map_id, duration, star_player_tag, event_id, mode_id)
+				VALUES (?,?,?,?,?,?,?,?,?,?)`)
+			if s != nil {
+				s.Exec(d.MatchID, d.BattleTime, d.Mode, d.Type, d.Map, d.MapID, d.Duration, d.StarPlayerTag, d.EventID, d.ModeID)
+			}
+		case "match_player":
+			d := op.data.(matchPlayerData)
+			s := prepare("match_player", `
+				INSERT OR IGNORE INTO match_players
+				(match_id, player_tag, brawler_name, brawler_id, brawler_power, brawler_trophies,
+				 skin_name, skin_id, is_winner, team_id, trophy_change, result, mode, map, match_type)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			if s != nil {
+				s.Exec(d.MatchID, d.PlayerTag, d.BrawlerName, d.BrawlerID, d.BrawlerPower, d.BrawlerTrophies,
+					d.SkinName, d.SkinID, d.IsWinner, d.TeamID, d.TrophyChange, d.Result, d.Mode, d.Map, d.MatchType)
+			}
+		case "status_404":
+			tag := op.data.(string)
+			s := prepare("status_404", `UPDATE players SET profile_updated_at=CURRENT_TIMESTAMP, is_processed=1 WHERE tag=?`)
+			if s != nil {
+				s.Exec(tag)
+			}
+		case "scan_done":
+			tag := op.data.(string)
+			s := prepare("scan_done", `UPDATE players SET last_battlelog_scan=CURRENT_TIMESTAMP WHERE tag=?`)
+			if s != nil {
+				s.Exec(tag)
+			}
+		case "new_tag":
+			tag := op.data.(string)
+			s := prepare("new_tag", `INSERT OR IGNORE INTO players (tag) VALUES (?)`)
+			if s != nil {
+				s.Exec(tag)
+			}
 		}
 	}
 
-	_ = stmtMatch.Close()
-	_ = stmtPlayer.Close()
-	_ = stmtUpsert.Close()
-	_ = stmtNewTag.Close()
-	_ = tx.Commit()
+	for _, s := range stmts {
+		s.Close()
+	}
+
+	if err := tx.Commit(); err != nil {
+		fmt.Println("[DB] Commit error:", err)
+		tx.Rollback()
+	}
 }
+
+// ─── Reporter ────────────────────────────────────────────────────────────────
 
 func reporter() {
 	ticker := time.NewTicker(5 * time.Second)
-	var lastProcessed uint64
+	var lastReq, lastEnrich uint64
 	for range ticker.C {
-		curr := atomic.LoadUint64(&tagsProcessed)
-		rate := (curr - lastProcessed) / 5
-		lastProcessed = curr
-		fmt.Printf("[NET %3d req/s] Total: %-6d | 429: %-4d | Errors: %-4d\n",
-			rate, curr, atomic.LoadUint64(&rateLimitsHit), atomic.LoadUint64(&errorsHit))
+		req     := atomic.LoadUint64(&totalRequests)
+		enr     := atomic.LoadUint64(&enriched)
+		disc    := atomic.LoadUint64(&discovered)
+		r429    := atomic.LoadUint64(&errors429)
+		rOther  := atomic.LoadUint64(&errorsOther)
+
+		reqRate := (req - lastReq) / 5
+		enrRate := (enr - lastEnrich) / 5
+		lastReq = req
+		lastEnrich = enr
+
+		fmt.Printf("[NET %3d req/s] ENRICH: %d/s (total %d) | DISCOV: %d | 429: %d | ERR: %d\n",
+			reqRate, enrRate, enr, disc, r429, rOther)
 	}
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+func doGET(client *http.Client, url, token string) ([]byte, int) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, 0
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 {
+		return nil, 429
+	}
+	if resp.StatusCode != 200 {
+		return nil, resp.StatusCode
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0
+	}
+	return body, 200
+}
+
+func cleanTag(tag string) string {
+	t := strings.TrimPrefix(tag, "#")
+	return strings.ToUpper(t)
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
