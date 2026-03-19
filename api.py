@@ -313,6 +313,7 @@ def search_player_by_name(name: str = Query(..., examples=["Pika"])):
         FROM players_search ps
         JOIN players p ON ps.tag = p.tag
         WHERE ps.name MATCH ?
+        GROUP BY p.tag
         ORDER BY p.trophies DESC
         LIMIT 200
     """

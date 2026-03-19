@@ -126,7 +126,7 @@ def migrate():
         AFTER INSERT ON players
         WHEN NEW.name IS NOT NULL AND NEW.name != ''
         BEGIN
-            INSERT OR REPLACE INTO players_search(tag, name) VALUES (NEW.tag, NEW.name);
+            INSERT INTO players_search(tag, name) VALUES (NEW.tag, NEW.name);
         END
     """)
     c.execute("""
@@ -134,7 +134,8 @@ def migrate():
         AFTER UPDATE OF name ON players
         WHEN NEW.name IS NOT NULL AND NEW.name != ''
         BEGIN
-            INSERT OR REPLACE INTO players_search(tag, name) VALUES (NEW.tag, NEW.name);
+            DELETE FROM players_search WHERE tag = OLD.tag;
+            INSERT INTO players_search(tag, name) VALUES (NEW.tag, NEW.name);
         END
     """)
 
